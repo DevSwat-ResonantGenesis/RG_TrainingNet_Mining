@@ -163,11 +163,6 @@ async def submit_gradient(request: GradientSubmitRequest):
         weight_shard_hash=request.weight_shard_hash,
     )
 
-    # Record in task manager
-    accepted = task_manager.submit_result(submission)
-    if not accepted:
-        raise HTTPException(status_code=400, detail="Gradient submission rejected by task manager")
-
     # Build compressed gradients for param server
     compressed = [CompressedGradient(
         indices=request.top_k_indices,
@@ -178,10 +173,15 @@ async def submit_gradient(request: GradientSubmitRequest):
         layer_name=f"layer_{request.batch_index}",
     )]
 
-    # Send to param server
+    # Verify hash integrity via param server FIRST
     ps_accepted = param_server.receive_gradient(submission, compressed)
     if not ps_accepted:
-        raise HTTPException(status_code=400, detail="Gradient rejected by parameter server")
+        raise HTTPException(status_code=400, detail="Gradient rejected by parameter server (hash mismatch or unregistered)")
+
+    # Only record in task manager after param server accepts
+    accepted = task_manager.submit_result(submission)
+    if not accepted:
+        raise HTTPException(status_code=400, detail="Gradient submission rejected by task manager")
 
     return {"status": "accepted", "submission_id": request.submission_id}
 
