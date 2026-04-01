@@ -38,6 +38,7 @@ from .genesis_seed import genesis_initializer
 from .param_server import param_server
 from .training_task import task_manager, GradientSubmission
 from .gradient_compressor import CompressedGradient, verify_gradient_hash
+from .auth_middleware import get_ws_user, check_rate_limit, AuthenticatedUser
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,14 @@ async def handle_mining_ws(ws: WebSocket):
     miner_id = None
 
     try:
+        # ── Auth: verify JWT before accepting ──
+        auth_user = await get_ws_user(ws)
+        if auth_user is None:
+            await ws.accept()
+            await ws.send_json({"event": "error", "message": "Authentication required — pass ?token=<jwt> or Authorization header"})
+            await ws.close(code=4001)
+            return
+
         # Wait for first message (must be register)
         await ws.accept()
         raw = await asyncio.wait_for(ws.receive_json(), timeout=30)
@@ -103,10 +112,13 @@ async def handle_mining_ws(ws: WebSocket):
             await ws.close()
             return
 
-        # Register miner
+        # Register miner — email comes from verified JWT, not self-reported
         miner_id = raw.get("miner_id", f"miner-{uuid4().hex[:8]}")
         miner_class = raw.get("miner_class", "miner")
-        account_email = raw.get("account_email", "")
+        account_email = auth_user.email or raw.get("account_email", "")
+
+        # Rate limit WS connections per user
+        check_rate_limit(auth_user.user_id or miner_id, "register")
 
         # Register with param server
         miner_state = param_server.register_miner(miner_id, miner_class)
@@ -116,11 +128,14 @@ async def handle_mining_ws(ws: WebSocket):
             ws_manager.active_connections[miner_id] = ws
             ws_manager.miner_metadata[miner_id] = {
                 "account_email": account_email,
+                "user_id": auth_user.user_id,
+                "org_id": auth_user.org_id,
+                "role": auth_user.role,
                 "miner_class": miner_class,
                 "connected_at": datetime.now(timezone.utc).isoformat(),
             }
 
-        logger.info(f"WS: Miner {miner_id} registered (class={miner_class}, email={account_email})")
+        logger.info(f"WS: Miner {miner_id} registered (class={miner_class}, user={auth_user.user_id}, email={account_email})")
 
         # Send welcome
         await ws.send_json({

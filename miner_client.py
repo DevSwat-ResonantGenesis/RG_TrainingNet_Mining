@@ -17,6 +17,12 @@ and runs the full mining lifecycle:
 
 Usage:
     python3 miner_client.py --email nemesh.liubov@gmail.com --cycles 5
+
+    # With JWT auth (production):
+    python3 miner_client.py --token <jwt> --cycles 5
+
+    # Or via env var:
+    AUTH_TOKEN=<jwt> python3 miner_client.py --cycles 5
 """
 
 import argparse
@@ -94,15 +100,24 @@ def simulate_training(task: dict, cycle: int) -> dict:
 # LIGHTHOUSE REGISTRATION (HTTP)
 # ────────────────────────────────────────────────────────────────
 
+def _auth_headers(token: str = None) -> dict:
+    """Build auth headers from JWT token."""
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 async def register_with_lighthouse(
     lighthouse_url: str,
     miner_id: str,
     miner_class: str,
+    token: str = None,
 ) -> dict:
     """Register this miner with the Lighthouse for peer discovery."""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"{lighthouse_url}/lighthouse/register",
+            headers=_auth_headers(token),
             json={
                 "peer_id": miner_id,
                 "peer_type": "validator" if "validator" in miner_class else "miner",
@@ -119,12 +134,13 @@ async def register_with_lighthouse(
         return data
 
 
-async def send_lighthouse_heartbeat(lighthouse_url: str, miner_id: str):
+async def send_lighthouse_heartbeat(lighthouse_url: str, miner_id: str, token: str = None):
     """Send heartbeat to Lighthouse."""
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             await client.post(
                 f"{lighthouse_url}/lighthouse/heartbeat",
+                headers=_auth_headers(token),
                 json={"peer_id": miner_id},
             )
     except Exception:
@@ -135,9 +151,9 @@ async def send_lighthouse_heartbeat(lighthouse_url: str, miner_id: str):
 # GENESIS INITIALIZATION (HTTP)
 # ────────────────────────────────────────────────────────────────
 
-async def ensure_genesis_initialized(mining_url: str, miner_id: str) -> dict:
+async def ensure_genesis_initialized(mining_url: str, miner_id: str, token: str = None) -> dict:
     """Check if genesis is initialized; if not, initialize it."""
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=10, headers=_auth_headers(token)) as client:
         # Check current status
         resp = await client.get(f"{mining_url}/mining/genesis/status")
         status = resp.json()
@@ -180,11 +196,17 @@ async def run_mining_loop(
     miner_class: str,
     account_email: str,
     num_cycles: int,
+    token: str = None,
 ):
     """Connect via WebSocket and run the mining loop."""
+    # Append JWT token as query param for WS auth
+    ws_connect_url = ws_url
+    if token:
+        sep = "&" if "?" in ws_url else "?"
+        ws_connect_url = f"{ws_url}{sep}token={token}"
     logger.info(f"Connecting to Mining WS: {ws_url}")
 
-    async with websockets.connect(ws_url) as ws:
+    async with websockets.connect(ws_connect_url) as ws:
         # Step 1: Register
         await ws.send(json.dumps({
             "action": "register",
@@ -339,7 +361,12 @@ async def main():
     parser.add_argument("--lighthouse-url", default="http://localhost:8700", help="Lighthouse URL")
     parser.add_argument("--mining-url", default="http://localhost:8701", help="Mining service URL")
     parser.add_argument("--mining-ws", default="ws://localhost:8701/ws/mining", help="Mining WS URL")
+    parser.add_argument("--token", default=None, help="JWT auth token (or set AUTH_TOKEN env var)")
     args = parser.parse_args()
+
+    # Token from CLI arg or env var
+    token = args.token or os.getenv("AUTH_TOKEN", "")
+    auth_mode = "JWT" if token else "dev (no auth)"
 
     miner_id = args.miner_id or f"miner-louie-{uuid4().hex[:6]}"
 
@@ -354,6 +381,7 @@ async def main():
     print(f"  Lighthouse:  {args.lighthouse_url}")
     print(f"  Mining API:  {args.mining_url}")
     print(f"  Mining WS:   {args.mining_ws}")
+    print(f"  Auth:        {auth_mode}")
     print("=" * 60)
     print()
 
@@ -361,7 +389,7 @@ async def main():
     logger.info("[PHASE 1] Registering with Lighthouse...")
     try:
         lh_result = await register_with_lighthouse(
-            args.lighthouse_url, miner_id, args.miner_class,
+            args.lighthouse_url, miner_id, args.miner_class, token=token,
         )
         bootstrap_peers = lh_result.get("bootstrap_peers", [])
         logger.info(f"  Registered with Lighthouse — {len(bootstrap_peers)} bootstrap peers discovered")
@@ -374,7 +402,7 @@ async def main():
     # Phase 2: Ensure genesis is initialized
     logger.info("\n[PHASE 2] Checking Genesis status...")
     try:
-        await ensure_genesis_initialized(args.mining_url, miner_id)
+        await ensure_genesis_initialized(args.mining_url, miner_id, token=token)
     except Exception as e:
         logger.error(f"  Genesis init failed: {e}")
         return
@@ -388,6 +416,7 @@ async def main():
             miner_class=args.miner_class,
             account_email=args.email,
             num_cycles=args.cycles,
+            token=token,
         )
     except Exception as e:
         logger.error(f"  Mining loop failed: {e}")
@@ -397,7 +426,7 @@ async def main():
 
     # Phase 4: Lighthouse heartbeat
     logger.info("\n[PHASE 4] Sending final Lighthouse heartbeat...")
-    await send_lighthouse_heartbeat(args.lighthouse_url, miner_id)
+    await send_lighthouse_heartbeat(args.lighthouse_url, miner_id, token=token)
 
     # ─── FINAL REPORT ───
     print()

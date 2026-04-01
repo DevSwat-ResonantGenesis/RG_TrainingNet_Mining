@@ -7,7 +7,7 @@ Provides endpoints for: genesis initialization, task management,
 gradient submission, miner registration, parameter server stats.
 """
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 
@@ -15,6 +15,11 @@ from .genesis_seed import genesis_initializer, SeedModelConfig
 from .param_server import param_server
 from .training_task import task_manager, GradientSubmission
 from .gradient_compressor import CompressedGradient, verify_gradient_hash
+from .auth_middleware import (
+    AuthenticatedUser,
+    get_current_user,
+    check_rate_limit,
+)
 
 router = APIRouter(prefix="/mining", tags=["mining"])
 
@@ -60,8 +65,15 @@ class TaskAssignRequest(BaseModel):
 # ============== Genesis Endpoints ==============
 
 @router.post("/genesis/initialize")
-async def initialize_genesis(request: GenesisInitRequest):
+async def initialize_genesis(
+    request: GenesisInitRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    req: Request = None,
+):
     """Initialize the genesis seed model and create training tasks."""
+    check_rate_limit(user.user_id or "anon", "genesis")
+    if not user.is_admin() and user.auth_method != "dev":
+        raise HTTPException(status_code=403, detail="Admin role required for genesis init")
     config = SeedModelConfig(model_id=request.model_id)
     state = await genesis_initializer.initialize(
         model_config=config,
@@ -72,14 +84,16 @@ async def initialize_genesis(request: GenesisInitRequest):
 
 
 @router.get("/genesis/status")
-async def get_genesis_status():
+async def get_genesis_status(user: AuthenticatedUser = Depends(get_current_user)):
     """Get genesis initialization status."""
+    check_rate_limit(user.user_id or "anon", "default")
     return genesis_initializer.get_status()
 
 
 @router.post("/genesis/assign-tasks")
-async def assign_genesis_tasks():
+async def assign_genesis_tasks(user: AuthenticatedUser = Depends(get_current_user)):
     """Assign pending tasks to registered miners."""
+    check_rate_limit(user.user_id or "anon", "genesis")
     assignments = await genesis_initializer.assign_tasks_to_miners()
     return {"assignments": assignments, "count": len(assignments)}
 
@@ -87,15 +101,20 @@ async def assign_genesis_tasks():
 # ============== Miner Registration ==============
 
 @router.post("/miners/register")
-async def register_miner(request: MinerRegisterRequest):
+async def register_miner(
+    request: MinerRegisterRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Register a miner with the parameter server."""
+    check_rate_limit(user.user_id or "anon", "register")
     state = param_server.register_miner(request.miner_id, request.miner_class)
     return {"status": "registered", "miner": state.to_dict()}
 
 
 @router.get("/miners")
-async def list_miners():
+async def list_miners(user: AuthenticatedUser = Depends(get_current_user)):
     """List all registered miners and their states."""
+    check_rate_limit(user.user_id or "anon", "default")
     return {
         "miners": param_server.get_miner_states(),
         "count": len(param_server.miners),
@@ -103,8 +122,9 @@ async def list_miners():
 
 
 @router.get("/miners/{miner_id}")
-async def get_miner(miner_id: str):
+async def get_miner(miner_id: str, user: AuthenticatedUser = Depends(get_current_user)):
     """Get a specific miner's state."""
+    check_rate_limit(user.user_id or "anon", "default")
     miner = param_server.miners.get(miner_id)
     if not miner:
         raise HTTPException(status_code=404, detail="Miner not found")
@@ -114,8 +134,12 @@ async def get_miner(miner_id: str):
 # ============== Task Management ==============
 
 @router.post("/tasks/assign")
-async def assign_task(request: TaskAssignRequest):
+async def assign_task(
+    request: TaskAssignRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Assign the next available training task to a miner."""
+    check_rate_limit(user.user_id or "anon", "task_assign")
     task = task_manager.assign_task(request.miner_id)
     if not task:
         raise HTTPException(status_code=404, detail="No tasks available")
@@ -123,13 +147,13 @@ async def assign_task(request: TaskAssignRequest):
 
 
 @router.get("/tasks/stats")
-async def get_task_stats():
+async def get_task_stats(user: AuthenticatedUser = Depends(get_current_user)):
     """Get task manager statistics."""
     return task_manager.get_stats()
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str):
+async def get_task(task_id: str, user: AuthenticatedUser = Depends(get_current_user)):
     """Get a specific task."""
     task = task_manager.tasks.get(task_id)
     if not task:
@@ -140,8 +164,12 @@ async def get_task(task_id: str):
 # ============== Gradient Submission ==============
 
 @router.post("/gradients/submit")
-async def submit_gradient(request: GradientSubmitRequest):
+async def submit_gradient(
+    request: GradientSubmitRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     """Submit a compressed gradient from a miner."""
+    check_rate_limit(user.user_id or request.miner_id, "gradient_submit")
     submission = GradientSubmission(
         submission_id=request.submission_id,
         task_id=request.task_id,
@@ -189,8 +217,9 @@ async def submit_gradient(request: GradientSubmitRequest):
 # ============== Aggregation ==============
 
 @router.post("/aggregate")
-async def trigger_aggregation():
+async def trigger_aggregation(user: AuthenticatedUser = Depends(get_current_user)):
     """Trigger gradient aggregation on the parameter server."""
+    check_rate_limit(user.user_id or "anon", "default")
     merged = param_server.aggregate()
     if merged is None:
         return {"status": "skipped", "reason": "Not enough gradients"}
@@ -204,13 +233,13 @@ async def trigger_aggregation():
 # ============== Parameter Server Stats ==============
 
 @router.get("/param-server/stats")
-async def get_param_server_stats():
+async def get_param_server_stats(user: AuthenticatedUser = Depends(get_current_user)):
     """Get parameter server statistics."""
     return param_server.get_stats()
 
 
 @router.get("/param-server/rewards")
-async def get_miner_rewards(year: int = 1):
+async def get_miner_rewards(year: int = 1, user: AuthenticatedUser = Depends(get_current_user)):
     """Get calculated rewards for all miners."""
     rewards = param_server.get_miner_rewards(year)
     return {"year": year, "rewards": rewards}

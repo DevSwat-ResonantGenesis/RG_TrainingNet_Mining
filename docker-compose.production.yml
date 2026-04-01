@@ -1,0 +1,97 @@
+version: "3.8"
+
+# ============================================================
+# PRODUCTION DOCKER COMPOSE — Mining + Lighthouse + Nginx
+# ============================================================
+#
+# Network isolation:
+#   - mining_public:   nginx ↔ mining + lighthouse (HTTP only)
+#   - mining_internal: mining ↔ lighthouse (TCP discovery)
+#   - TCP :8600 is ONLY on mining_internal (not exposed to host)
+#
+# Usage:
+#   AUTH_JWT_SECRET_KEY=<your-key> AUTH_INTERNAL_SERVICE_KEY=<key> \
+#   docker compose -f docker-compose.production.yml up -d
+# ============================================================
+
+services:
+
+  # ── RG Lighthouse (Bootstrap/Discovery) ──
+  lighthouse:
+    build:
+      context: ../RG_lighthouse
+      dockerfile: Dockerfile
+    container_name: rg_lighthouse
+    restart: unless-stopped
+    environment:
+      - NODE_ID=lighthouse-0
+      - P2P_PORT=8600
+      - P2P_MAX_PEERS=500
+      - AUTH_JWT_SECRET_KEY=${AUTH_JWT_SECRET_KEY}
+      - AUTH_INTERNAL_SERVICE_KEY=${AUTH_INTERNAL_SERVICE_KEY}
+    networks:
+      - mining_public
+      - mining_internal
+    expose:
+      - "8000"   # API (internal to nginx)
+      - "8600"   # TCP discovery (internal only)
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/lighthouse/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── RG Mining (Training Orchestration) ──
+  mining:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rg_mining
+    restart: unless-stopped
+    environment:
+      - AUTH_JWT_SECRET_KEY=${AUTH_JWT_SECRET_KEY}
+      - AUTH_INTERNAL_SERVICE_KEY=${AUTH_INTERNAL_SERVICE_KEY}
+      - LIGHTHOUSE_URL=http://lighthouse:8000
+      - EXTERNAL_BLOCKCHAIN_URL=http://external_blockchain:8000
+    networks:
+      - mining_public
+      - mining_internal
+    expose:
+      - "8000"   # API + WS (internal to nginx)
+    depends_on:
+      lighthouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Nginx Reverse Proxy (TLS + Rate Limiting) ──
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: rg_mining_nginx
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/mining-lighthouse.conf:/etc/nginx/conf.d/default.conf:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    networks:
+      - mining_public
+    depends_on:
+      mining:
+        condition: service_healthy
+      lighthouse:
+        condition: service_healthy
+
+networks:
+  # Public: nginx ↔ services (HTTP/WS only)
+  mining_public:
+    driver: bridge
+
+  # Internal: service ↔ service (TCP discovery, no external access)
+  mining_internal:
+    driver: bridge
+    internal: true   # ← KEY: not accessible from host or internet
