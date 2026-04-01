@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ResonantGenesis — Mesh Dashboard</title>
+<style>
+  :root {
+    --bg: #0a0e17; --bg2: #111827; --bg3: #1f2937;
+    --text: #e5e7eb; --muted: #9ca3af; --accent: #6366f1;
+    --green: #10b981; --red: #ef4444; --yellow: #f59e0b;
+    --cyan: #06b6d4; --purple: #a78bfa; --border: #374151;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,system-ui,sans-serif; min-height:100vh; }
+
+  /* Header */
+  .header { background:var(--bg2); border-bottom:1px solid var(--border); padding:16px 24px; display:flex; align-items:center; justify-content:space-between; }
+  .header h1 { font-size:20px; font-weight:700; letter-spacing:-0.5px; }
+  .header h1 span { color:var(--accent); }
+  .header-right { display:flex; align-items:center; gap:16px; font-size:13px; color:var(--muted); }
+  .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; }
+  .status-dot.ok { background:var(--green); box-shadow:0 0 6px var(--green); }
+  .status-dot.err { background:var(--red); }
+  .refresh-btn { background:var(--bg3); border:1px solid var(--border); color:var(--text); padding:6px 14px; border-radius:6px; cursor:pointer; font-size:12px; }
+  .refresh-btn:hover { background:var(--accent); border-color:var(--accent); }
+
+  /* Grid */
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(380px,1fr)); gap:16px; padding:20px 24px; }
+
+  /* Card */
+  .card { background:var(--bg2); border:1px solid var(--border); border-radius:12px; overflow:hidden; }
+  .card-header { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; }
+  .card-header h2 { font-size:14px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; }
+  .card-icon { font-size:16px; }
+  .card-body { padding:16px 18px; }
+
+  /* Stats grid inside card */
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .stat { }
+  .stat-label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:2px; }
+  .stat-value { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .stat-value.green { color:var(--green); }
+  .stat-value.cyan { color:var(--cyan); }
+  .stat-value.purple { color:var(--purple); }
+  .stat-value.yellow { color:var(--yellow); }
+  .stat-value.accent { color:var(--accent); }
+
+  /* Full-width card */
+  .full-width { grid-column: 1 / -1; }
+
+  /* Table */
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; padding:8px 10px; color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:0.5px; border-bottom:1px solid var(--border); }
+  td { padding:8px 10px; border-bottom:1px solid rgba(55,65,81,0.5); font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:none; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+  .badge-green { background:rgba(16,185,129,0.15); color:var(--green); }
+  .badge-cyan { background:rgba(6,182,212,0.15); color:var(--cyan); }
+  .badge-purple { background:rgba(167,139,250,0.15); color:var(--purple); }
+  .badge-yellow { background:rgba(245,158,11,0.15); color:var(--yellow); }
+  .badge-accent { background:rgba(99,102,241,0.15); color:var(--accent); }
+  .mono { font-family:'JetBrains Mono',monospace; font-size:12px; }
+
+  /* Block list */
+  .block-item { display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid rgba(55,65,81,0.5); }
+  .block-item:last-child { border-bottom:none; }
+  .block-num { background:var(--accent); color:white; width:36px; height:36px; border-radius:8px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:14px; flex-shrink:0; }
+  .block-info { flex:1; min-width:0; }
+  .block-hash { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .block-meta { font-size:12px; color:var(--muted); margin-top:2px; }
+  .block-txcount { font-weight:600; color:var(--cyan); }
+
+  /* Loading */
+  .loading { text-align:center; padding:40px; color:var(--muted); }
+  .error-msg { color:var(--red); font-size:13px; padding:12px; }
+
+  @media (max-width:800px) {
+    .grid { grid-template-columns:1fr; padding:12px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>⚡ <span>Resonant</span>Genesis — Mesh Dashboard</h1>
+  <div class="header-right">
+    <span id="status-indicator"><span class="status-dot" id="dot"></span> <span id="status-text">Loading…</span></span>
+    <span id="last-update"></span>
+    <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+  </div>
+</div>
+
+<div class="grid" id="grid">
+  <div class="loading" id="loading">Loading mesh data…</div>
+</div>
+
+<script>
+const API = window.location.origin;
+let data = null;
+
+async function fetchData() {
+  try {
+    const [dashRes, blocksRes] = await Promise.all([
+      fetch(`${API}/dashboard/data`),
+      fetch(`${API}/dashboard/blocks?limit=8`),
+    ]);
+    const dash = await dashRes.json();
+    const blocks = await blocksRes.json();
+    dash.recent_blocks = blocks.blocks || [];
+    return dash;
+  } catch(e) {
+    console.error('Fetch error:', e);
+    return null;
+  }
+}
+
+function renderCards(d) {
+  const bc = d.blockchain || {};
+  const st = bc.status || {};
+  const lb = bc.latest_block || {};
+  const ci = bc.integrity || {};
+  const lh = d.lighthouse || {};
+  const mi = d.mining || {};
+  const ps = mi.param_server || {};
+  const ts = mi.tasks || {};
+  const cb = mi.chain_bridge || {};
+  const blocks = d.recent_blocks || [];
+  const peers = lh.peers || [];
+  const miners = mi.miners || [];
+
+  return `
+    <!-- Blockchain -->
+    <div class="card">
+      <div class="card-header"><span class="card-icon">⛓</span><h2>External Blockchain</h2></div>
+      <div class="card-body">
+        <div class="stats">
+          <div class="stat"><div class="stat-label">Chain Height</div><div class="stat-value cyan">${st.chain_height || 0}</div></div>
+          <div class="stat"><div class="stat-label">Pending TXs</div><div class="stat-value yellow">${st.pending_transactions || 0}</div></div>
+          <div class="stat"><div class="stat-label">Consensus</div><div class="stat-value green">${(st.consensus_state||'—').toUpperCase()}</div></div>
+          <div class="stat"><div class="stat-label">Term</div><div class="stat-value accent">${st.consensus_term || 0}</div></div>
+          <div class="stat"><div class="stat-label">Leader</div><div class="stat-value" style="font-size:14px">${st.leader || '—'}</div></div>
+          <div class="stat"><div class="stat-label">Chain Valid</div><div class="stat-value ${ci.valid ? 'green':'red'}">${ci.valid ? '✓ VALID':'✗ INVALID'}</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Mining Service -->
+    <div class="card">
+      <div class="card-header"><span class="card-icon">⚒</span><h2>Mining Service</h2></div>
+      <div class="card-body">
+        <div class="stats">
+          <div class="stat"><div class="stat-label">Global Step</div><div class="stat-value accent">${ps.global_step || 0}</div></div>
+          <div class="stat"><div class="stat-label">WS Miners</div><div class="stat-value cyan">${mi.ws_connected || 0}</div></div>
+          <div class="stat"><div class="stat-label">Genesis</div><div class="stat-value ${mi.genesis_initialized?'green':'yellow'}">${mi.genesis_initialized ? '✓ INIT':'PENDING'}</div></div>
+          <div class="stat"><div class="stat-label">Registered Miners</div><div class="stat-value purple">${mi.miner_count || 0}</div></div>
+          <div class="stat"><div class="stat-label">Tasks Pending</div><div class="stat-value yellow">${ts.pending || ts.queue_size || 0}</div></div>
+          <div class="stat"><div class="stat-label">Tasks Completed</div><div class="stat-value green">${ts.completed || 0}</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chain Bridge -->
+    <div class="card">
+      <div class="card-header"><span class="card-icon">🔗</span><h2>Chain Bridge</h2></div>
+      <div class="card-body">
+        <div class="stats">
+          <div class="stat"><div class="stat-label">On-chain TXs</div><div class="stat-value green">${cb.tx_count || 0}</div></div>
+          <div class="stat"><div class="stat-label">TX Errors</div><div class="stat-value ${cb.tx_errors>0?'red':''}">${cb.tx_errors || 0}</div></div>
+          <div class="stat"><div class="stat-label">Chain URL</div><div class="stat-value" style="font-size:11px;word-break:break-all">${cb.chain_url || '—'}</div></div>
+          <div class="stat"><div class="stat-label">Lighthouse URL</div><div class="stat-value" style="font-size:11px;word-break:break-all">${cb.lighthouse_url || '—'}</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Lighthouse Peers -->
+    <div class="card">
+      <div class="card-header"><span class="card-icon">🗼</span><h2>Lighthouse Peers (${peers.length})</h2></div>
+      <div class="card-body">
+        ${peers.length === 0 ? '<div style="color:var(--muted);font-size:13px">No peers registered</div>' : `
+        <table>
+          <tr><th>Peer ID</th><th>Type</th><th>Address</th><th>Capabilities</th></tr>
+          ${peers.map(p => `
+          <tr>
+            <td class="mono">${p.peer_id}</td>
+            <td><span class="badge badge-${p.peer_type==='validator'?'purple':p.peer_type==='chain'?'cyan':p.peer_type==='miner'?'green':'yellow'}">${p.peer_type}</span></td>
+            <td class="mono">${p.address}:${p.api_port}</td>
+            <td>${(p.capabilities||[]).map(c=>`<span class="badge badge-accent">${c}</span> `).join('')}</td>
+          </tr>`).join('')}
+        </table>`}
+      </div>
+    </div>
+
+    <!-- Miners -->
+    <div class="card">
+      <div class="card-header"><span class="card-icon">👷</span><h2>Registered Miners (${miners.length})</h2></div>
+      <div class="card-body">
+        ${miners.length === 0 ? '<div style="color:var(--muted);font-size:13px">No miners registered</div>' : `
+        <table>
+          <tr><th>Miner ID</th><th>Class</th><th>Gradients</th><th>Trust</th><th>Samples</th></tr>
+          ${miners.map(m => `
+          <tr>
+            <td class="mono">${m.miner_id || '—'}</td>
+            <td><span class="badge badge-purple">${m.miner_class || '—'}</span></td>
+            <td>${m.total_gradients_submitted || 0}</td>
+            <td style="color:${(m.trust_score||0)>=0.8?'var(--green)':'var(--yellow)'}">${(m.trust_score||0).toFixed(2)}</td>
+            <td>${(m.total_samples_trained||0).toLocaleString()}</td>
+          </tr>`).join('')}
+        </table>`}
+      </div>
+    </div>
+
+    <!-- Recent Blocks -->
+    <div class="card full-width">
+      <div class="card-header"><span class="card-icon">📦</span><h2>Recent Blocks</h2></div>
+      <div class="card-body">
+        ${blocks.length === 0 ? '<div style="color:var(--muted);font-size:13px">No blocks yet</div>' : blocks.slice().reverse().map(b => `
+        <div class="block-item">
+          <div class="block-num">${b.number}</div>
+          <div class="block-info">
+            <div class="block-hash">${b.hash}</div>
+            <div class="block-meta">
+              <span class="block-txcount">${b.transaction_count} txs</span>
+              · validator: ${b.validator}
+              · ${new Date(b.timestamp).toLocaleTimeString()}
+            </div>
+          </div>
+        </div>`).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function refresh() {
+  const d = await fetchData();
+  const dot = document.getElementById('dot');
+  const statusText = document.getElementById('status-text');
+  const grid = document.getElementById('grid');
+  const lastUp = document.getElementById('last-update');
+
+  if (!d) {
+    dot.className = 'status-dot err';
+    statusText.textContent = 'Offline';
+    return;
+  }
+
+  data = d;
+  dot.className = 'status-dot ok';
+  statusText.textContent = 'Mesh Online';
+  lastUp.textContent = new Date().toLocaleTimeString();
+  grid.innerHTML = renderCards(d);
+}
+
+// Initial load + auto-refresh every 5 seconds
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

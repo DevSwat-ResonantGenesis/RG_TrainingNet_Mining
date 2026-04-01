@@ -39,6 +39,7 @@ from .param_server import param_server
 from .training_task import task_manager, GradientSubmission
 from .gradient_compressor import CompressedGradient, verify_gradient_hash
 from .auth_middleware import get_ws_user, check_rate_limit, AuthenticatedUser
+from .chain_bridge import chain_bridge
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,19 @@ async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):
 
         logger.info(f"WS: Gradient accepted from {miner_id} (loss={submission.loss_after:.4f}, reward={reward})")
 
+        # Record on external blockchain (fire-and-forget)
+        asyncio.create_task(chain_bridge.record_gradient_on_chain(
+            miner_id=miner_id,
+            task_id=submission.task_id,
+            gradient_hash=submission.gradient_hash,
+            loss_value=submission.loss_after,
+            samples_processed=submission.samples_processed,
+            reward_amount=reward,
+            submission_id=submission.submission_id,
+            model_id=submission.model_id,
+            global_step=param_server.global_step,
+        ))
+
         # Auto-aggregate if enough gradients pending
         if len(param_server.pending_gradients) >= param_server.MIN_MINERS_PER_ROUND:
             merged = param_server.aggregate()
@@ -294,6 +308,12 @@ async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):
                     "global_step": param_server.global_step,
                     "layers_merged": len(merged),
                 })
+                # Record aggregation on-chain
+                asyncio.create_task(chain_bridge.record_aggregation_on_chain(
+                    global_step=param_server.global_step,
+                    layers_merged=len(merged),
+                    miners_contributed=len(param_server.miners),
+                ))
 
     except KeyError as e:
         await ws.send_json({"event": "error", "message": f"Missing field: {e}"})

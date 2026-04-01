@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
 
@@ -20,14 +21,22 @@ except ImportError:
     setup_exception_handlers = None
 
 from .routers import router
+from .dashboard_api import router as dashboard_router
 from .ws_handler import handle_mining_ws, ws_manager
+from .chain_bridge import chain_bridge
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
     logger.info("RG Mining Service starting...")
+    # Register with Lighthouse (non-blocking, best-effort)
+    try:
+        await chain_bridge.register_with_lighthouse(service_type="mining")
+    except Exception as e:
+        logger.warning(f"Lighthouse registration skipped: {e}")
     yield
+    await chain_bridge.close()
     logger.info("RG Mining Service stopped")
 
 
@@ -52,6 +61,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(dashboard_router)
 
 
 @app.get("/")
@@ -61,7 +71,21 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "rg-mining", "ws_miners": ws_manager.connected_count}
+    return {
+        "status": "ok",
+        "service": "rg-mining",
+        "ws_miners": ws_manager.connected_count,
+        "chain_bridge": chain_bridge.get_stats(),
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the mesh dashboard UI."""
+    import os
+    html_path = os.path.join(os.path.dirname(__file__), "..", "dashboard", "index.html")
+    with open(html_path, "r") as f:
+        return HTMLResponse(content=f.read())
 
 
 @app.websocket("/ws/mining")

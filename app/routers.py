@@ -20,6 +20,7 @@ from .auth_middleware import (
     get_current_user,
     check_rate_limit,
 )
+from .chain_bridge import chain_bridge
 
 router = APIRouter(prefix="/mining", tags=["mining"])
 
@@ -210,6 +211,20 @@ async def submit_gradient(
     accepted = task_manager.submit_result(submission)
     if not accepted:
         raise HTTPException(status_code=400, detail="Gradient submission rejected by task manager")
+
+    # Record on external blockchain (fire-and-forget)
+    import asyncio
+    asyncio.create_task(chain_bridge.record_gradient_on_chain(
+        miner_id=request.miner_id,
+        task_id=request.task_id,
+        gradient_hash=request.gradient_hash,
+        loss_value=request.loss_after,
+        samples_processed=request.samples_processed,
+        reward_amount=0,  # REST path doesn't calculate reward inline
+        submission_id=request.submission_id,
+        model_id=request.model_id,
+        global_step=param_server.global_step,
+    ))
 
     return {"status": "accepted", "submission_id": request.submission_id}
 
