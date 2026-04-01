@@ -266,6 +266,9 @@ class TaskManager:
         self.tasks: Dict[str, TrainingTask] = {}
         self.submissions: Dict[str, GradientSubmission] = {}
         self._task_queue: List[str] = []
+        self._current_epoch: int = 0
+        self._last_model_id: str = "resonant-seed-1b"
+        self._replenish_batch_size: int = 8
 
     def create_task(
         self,
@@ -296,11 +299,12 @@ class TaskManager:
         )
         self.tasks[task.task_id] = task
         self._task_queue.append(task.task_id)
+        self._last_model_id = model_id
         logger.info(f"Created training task {task.task_id} for model {model_id} epoch {epoch} batch {batch_index}")
         return task
 
     def assign_task(self, miner_id: str) -> Optional[TrainingTask]:
-        """Assign next available task to a miner agent."""
+        """Assign next available task to a miner agent. Auto-replenishes when empty."""
         # Expire old tasks first
         self._expire_stale_tasks()
 
@@ -314,7 +318,39 @@ class TaskManager:
                 logger.info(f"Assigned task {task_id} to miner {miner_id}")
                 return task
 
+        # Auto-replenish: create new epoch of tasks when queue is exhausted
+        self._replenish_tasks()
+        if self._task_queue:
+            return self.assign_task(miner_id)
+
         return None
+
+    def _replenish_tasks(self):
+        """Auto-create a new batch of training tasks for the next epoch."""
+        self._current_epoch += 1
+        model_id = self._last_model_id
+        batch_count = self._replenish_batch_size
+        logger.info(f"Auto-replenishing {batch_count} tasks for epoch {self._current_epoch} (model={model_id})")
+
+        for i in range(batch_count):
+            shard_hash = hashlib.sha256(f"{model_id}-epoch{self._current_epoch}-batch{i}".encode()).hexdigest()[:16]
+            self.create_task(
+                model_id=model_id,
+                epoch=self._current_epoch,
+                batch_index=i,
+                data_shard_url=f"hf://resonant-genesis/training-data/shard_{i}.parquet",
+                data_shard_hash=shard_hash,
+                num_samples=244140,
+                weight_shard_url=f"s3://rg-weights/{model_id}/epoch_{self._current_epoch}/weights.pt",
+                weight_shard_hash=hashlib.sha256(f"{model_id}-weights-{self._current_epoch}".encode()).hexdigest()[:16],
+                task_type=TaskType.FORWARD_BACKWARD,
+                learning_rate=3e-4,
+                batch_size=8,
+                gradient_accumulation_steps=4,
+                max_seq_length=4096,
+                bf16=True,
+            )
+        logger.info(f"Replenished {batch_count} tasks — queue now has {len(self._task_queue)} pending")
 
     def submit_result(self, submission: GradientSubmission) -> bool:
         """Record a gradient submission from a miner."""
