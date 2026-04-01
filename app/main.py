@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ except ImportError:
     setup_exception_handlers = None
 
 from .routers import router
+from .ws_handler import handle_mining_ws, ws_manager
 
 
 @asynccontextmanager
@@ -60,4 +61,10 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "rg-mining"}
+    return {"status": "ok", "service": "rg-mining", "ws_miners": ws_manager.connected_count}
+
+
+@app.websocket("/ws/mining")
+async def mining_websocket(ws: WebSocket):
+    """WebSocket endpoint for miner agents — real-time task streaming and gradient submission."""
+    await handle_mining_ws(ws)
