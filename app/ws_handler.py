@@ -285,6 +285,20 @@ async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):
 
         logger.info(f"WS: Gradient accepted from {miner_id} (loss={submission.loss_after:.4f}, reward={reward})")
 
+        # Credit miner's wallet via Crypto service (fire-and-forget)
+        meta = ws_manager.miner_metadata.get(miner_id, {})
+        asyncio.create_task(chain_bridge.credit_miner_wallet(
+            user_id=meta.get("user_id"),
+            email=meta.get("account_email"),
+            rgt_amount=reward,
+            samples_processed=submission.samples_processed,
+            trust_score=miner.trust_score if miner else 1.0,
+            tier=miner.miner_class if miner else "miner",
+            gradient_hash=submission.gradient_hash,
+            task_id=submission.task_id,
+            global_step=param_server.global_step,
+        ))
+
         # Record on external blockchain (fire-and-forget)
         asyncio.create_task(chain_bridge.record_gradient_on_chain(
             miner_id=miner_id,

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # ── Configuration ──
 EXTERNAL_BLOCKCHAIN_URL = os.getenv("EXTERNAL_BLOCKCHAIN_URL", "http://localhost:8702")
 LIGHTHOUSE_URL = os.getenv("LIGHTHOUSE_URL", "http://localhost:8700")
+CRYPTO_SERVICE_URL = os.getenv("CRYPTO_SERVICE_URL", "http://localhost:8010")
 NODE_ID = os.getenv("NODE_ID", "mining-node-0")
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
 INTERNAL_SERVICE_KEY = os.getenv("AUTH_INTERNAL_SERVICE_KEY", "")
@@ -44,9 +45,12 @@ class ChainBridge:
         self._client: Optional[httpx.AsyncClient] = None
         self._chain_url = EXTERNAL_BLOCKCHAIN_URL
         self._lighthouse_url = LIGHTHOUSE_URL
+        self._crypto_url = CRYPTO_SERVICE_URL
         self._enabled = True
         self._tx_count = 0
         self._tx_errors = 0
+        self._credit_count = 0
+        self._credit_errors = 0
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -148,6 +152,63 @@ class ChainBridge:
         except Exception as e:
             logger.warning(f"Chain bridge: failed to post aggregation tx: {e}")
 
+    # ── Crypto wallet credit ──
+
+    async def credit_miner_wallet(
+        self,
+        user_id: Optional[str],
+        email: Optional[str],
+        rgt_amount: float,
+        samples_processed: int,
+        trust_score: float = 1.0,
+        tier: str = "miner",
+        gradient_hash: str = "",
+        task_id: str = "",
+        global_step: int = 0,
+    ):
+        """
+        Credit mined $RGT to the user's wallet via Crypto service.
+        Fire-and-forget — never blocks training.
+        """
+        if not self._enabled:
+            return
+        if not user_id and not email:
+            return
+
+        payload = {
+            "user_id": user_id,
+            "email": email,
+            "rgt_amount": rgt_amount,
+            "tasks_delta": 1,
+            "samples_delta": samples_processed,
+            "trust_score": trust_score,
+            "tier": tier,
+            "gradient_hash": gradient_hash,
+            "task_id": task_id,
+            "global_step": global_step,
+        }
+
+        try:
+            client = await self._get_client()
+            resp = await client.post(
+                f"{self._crypto_url}/crypto/miner/credit",
+                json=payload,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                self._credit_count += 1
+                logger.info(
+                    f"💰 Wallet credit: {rgt_amount} RGT → "
+                    f"user={user_id or email} "
+                    f"(total={data.get('rgt_earned', '?')})"
+                )
+            else:
+                self._credit_errors += 1
+                logger.warning(f"Wallet credit failed ({resp.status_code}): {resp.text[:200]}")
+        except Exception as e:
+            self._credit_errors += 1
+            logger.warning(f"Wallet credit failed: {e}")
+
     # ── Lighthouse registration ──
 
     async def register_with_lighthouse(self, service_type: str = "mining"):
@@ -198,8 +259,11 @@ class ChainBridge:
             "enabled": self._enabled,
             "chain_url": self._chain_url,
             "lighthouse_url": self._lighthouse_url,
+            "crypto_url": self._crypto_url,
             "tx_count": self._tx_count,
             "tx_errors": self._tx_errors,
+            "credit_count": self._credit_count,
+            "credit_errors": self._credit_errors,
         }
 
 
