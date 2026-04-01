@@ -30,6 +30,15 @@ from .chain_bridge import chain_bridge
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
     logger.info("RG Mining Service starting...")
+
+    # Initialize ML database tables
+    try:
+        from .ml_db import init_ml_tables
+        await init_ml_tables()
+        logger.info("ML database tables ready")
+    except Exception as e:
+        logger.warning(f"ML database init skipped (non-fatal): {e}")
+
     # Register with Lighthouse (non-blocking, best-effort)
     try:
         await chain_bridge.register_with_lighthouse(service_type="mining")

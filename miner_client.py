@@ -10,13 +10,17 @@ and runs the full mining lifecycle:
   2. Connect to Mining service via WebSocket
   3. Register as miner under account email
   4. Request training tasks
-  5. Simulate training (compute gradient)
+  5. Train model (REAL forward/backward pass on GPU/CPU)
   6. Submit compressed gradient with correct SHA256 hash
   7. Receive reward confirmation
   8. Loop
 
 Usage:
+    # REAL TRAINING (default — requires torch):
     python3 miner_client.py --email nemesh.liubov@gmail.com --cycles 5
+
+    # Simulated training (for testing without GPU):
+    python3 miner_client.py --email nemesh.liubov@gmail.com --cycles 5 --simulate
 
     # With JWT auth (production):
     python3 miner_client.py --token <jwt> --cycles 5
@@ -46,6 +50,15 @@ except ImportError:
     print("ERROR: pip3 install websockets")
     sys.exit(1)
 
+# Real training imports (optional — falls back to simulation)
+REAL_TRAINING_AVAILABLE = False
+try:
+    import torch
+    REAL_TRAINING_AVAILABLE = True
+    _DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
+except ImportError:
+    _DEVICE = "cpu"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(message)s",
@@ -55,31 +68,117 @@ logger = logging.getLogger("miner-agent")
 
 
 # ────────────────────────────────────────────────────────────────
-# GRADIENT SIMULATION
+# TRAINING — Real or Simulated
 # ────────────────────────────────────────────────────────────────
+
+# Persistent model & data across cycles (loaded once, reused)
+_model = None
+_data = None
+_tokenizer = None
+
+
+def _init_real_training(task: dict):
+    """Initialize model + data for real training. Called once."""
+    global _model, _data, _tokenizer
+    if _model is not None:
+        return  # Already initialized
+
+    from app.model_architecture import create_model, ResonantModelConfig
+    from app.real_trainer import get_tokenizer, DataShardLoader, DEVICE
+
+    model_id = task.get("model_id", "resonant-seed-1b")
+    logger.info(f"  [REAL] Initializing model: {model_id}")
+    _model, _ = create_model(model_id)
+    _model = _model.to(DEVICE)
+    logger.info(f"  [REAL] Model loaded on {DEVICE} ({sum(p.numel() for p in _model.parameters()):,} params)")
+
+    # Load training data
+    _tokenizer = get_tokenizer()
+    loader = DataShardLoader(_tokenizer, max_seq_length=task.get("max_seq_length", 4096))
+    try:
+        logger.info("  [REAL] Loading training data from HuggingFace (FineWeb-Edu)...")
+        _data = loader.load_from_huggingface(
+            dataset_name="HuggingFaceFW/fineweb-edu",
+            num_samples=max(500, task.get("batch_size", 8) * 20),
+        )
+    except Exception as e:
+        logger.warning(f"  [REAL] HF dataset unavailable ({e}), generating synthetic data")
+        _data = loader._generate_synthetic_data(
+            num_samples=max(500, task.get("batch_size", 8) * 20)
+        )
+    logger.info(f"  [REAL] Data loaded: {_data.shape}")
+
+
+def real_training(task: dict, cycle: int) -> dict:
+    """
+    REAL training step: forward/backward pass on actual PyTorch model.
+    Uses GPU (CUDA/MPS) when available, falls back to CPU.
+    """
+    from app.real_trainer import RealTrainer, compress_gradients, DEVICE
+
+    # Initialize model + data on first call
+    _init_real_training(task)
+
+    batch_size = task.get("batch_size", 8)
+    learning_rate = task.get("learning_rate", 3e-4)
+
+    # Select batch for this cycle
+    start_idx = (cycle * batch_size) % len(_data)
+    batch = _data[start_idx:start_idx + batch_size]
+    if len(batch) < batch_size:
+        batch = _data[:batch_size]
+
+    input_ids = batch[:, :-1].to(DEVICE)
+    labels = batch[:, 1:].to(DEVICE)
+
+    # Loss BEFORE training
+    _model.eval()
+    with torch.no_grad():
+        pre = _model(input_ids=input_ids, labels=labels)
+        loss_before = pre["loss"].item()
+
+    # Real forward + backward
+    trainer = RealTrainer(_model, task, DEVICE)
+    result = trainer.train_step(input_ids, labels, learning_rate)
+    loss_after = result["loss"]
+
+    # Top-K gradient compression
+    compressed = compress_gradients(result["gradients"], top_k_ratio=0.01)
+
+    return {
+        "top_k_indices": compressed["top_k_indices"],
+        "top_k_values": compressed["top_k_values"],
+        "original_size": compressed["original_size"],
+        "compressed_size": compressed["compressed_size"],
+        "compression_ratio": compressed["compression_ratio"],
+        "gradient_hash": compressed["gradient_hash"],
+        "loss_before": round(loss_before, 6),
+        "loss_after": round(loss_after, 6),
+        "samples_processed": result["samples_in_batch"] * result["seq_length"],
+        "training_time_seconds": round(result["training_time_seconds"], 2),
+        "device": result["device"],
+        "grad_norm": result["grad_norm"],
+        "real_training": True,
+    }
+
 
 def simulate_training(task: dict, cycle: int) -> dict:
     """
-    Simulate a training step: generate fake but structurally valid gradients.
-    In production this would run the actual forward/backward pass on GPU.
+    LEGACY: Simulate a training step with fake gradients.
+    Only used with --simulate flag for testing without PyTorch.
     """
-    num_params = 100_000  # simulated layer size
-    k = 10               # Top-K compressed size
+    num_params = 100_000
+    k = 10
 
-    # Generate random Top-K indices and values
     indices = sorted(random.sample(range(num_params), k))
     values = [round(random.gauss(0, 0.05), 6) for _ in range(k)]
 
-    # Compute correct SHA256 hash (must match what param server verifies)
     hash_input = json.dumps({"indices": indices, "values": values}, sort_keys=True).encode()
     gradient_hash = hashlib.sha256(hash_input).hexdigest()
 
-    # Simulate loss decrease over cycles
     base_loss = 11.0 - (cycle * 0.3)
     loss_before = base_loss + random.uniform(-0.1, 0.1)
     loss_after = loss_before - random.uniform(0.5, 1.5)
-
-    # Simulate training time
     training_time = random.uniform(20.0, 60.0)
 
     return {
@@ -93,6 +192,7 @@ def simulate_training(task: dict, cycle: int) -> dict:
         "loss_after": round(max(0.5, loss_after), 4),
         "samples_processed": task.get("num_samples", 244140),
         "training_time_seconds": round(training_time, 2),
+        "real_training": False,
     }
 
 
@@ -195,8 +295,9 @@ async def run_mining_loop(
     miner_id: str,
     miner_class: str,
     account_email: str,
-    num_cycles: int,
+    num_cycles: int = 5,
     token: str = None,
+    use_real_training: bool = True,
 ):
     """Connect via WebSocket and run the mining loop."""
     # Append JWT token as query param for WS auth
@@ -255,15 +356,22 @@ async def run_mining_loop(
                 f"bf16: {task['bf16']} | Deadline: {task['deadline_seconds']}s"
             )
 
-            # Step 3: Simulate training
-            logger.info(f"  Training... (simulating forward/backward pass)")
+            # Step 3: Train (real or simulated)
+            use_real = use_real_training and REAL_TRAINING_AVAILABLE
+            mode_str = f"REAL on {_DEVICE}" if use_real else "SIMULATED"
+            logger.info(f"  Training... ({mode_str})")
             train_start = time.time()
-            grad_data = simulate_training(task, cycle)
-            await asyncio.sleep(0.5)  # simulate computation time
+
+            if use_real:
+                grad_data = real_training(task, cycle)
+            else:
+                grad_data = simulate_training(task, cycle)
+                await asyncio.sleep(0.5)
+
             train_elapsed = time.time() - train_start
 
             logger.info(
-                f"  Training complete in {train_elapsed:.1f}s (simulated {grad_data['training_time_seconds']:.1f}s)"
+                f"  Training complete in {train_elapsed:.1f}s"
             )
             logger.info(
                 f"    Loss: {grad_data['loss_before']:.4f} → {grad_data['loss_after']:.4f} "
@@ -362,11 +470,15 @@ async def main():
     parser.add_argument("--mining-url", default="http://localhost:8701", help="Mining service URL")
     parser.add_argument("--mining-ws", default="ws://localhost:8701/ws/mining", help="Mining WS URL")
     parser.add_argument("--token", default=None, help="JWT auth token (or set AUTH_TOKEN env var)")
+    parser.add_argument("--simulate", action="store_true", help="Use simulated training (no GPU needed)")
+    parser.add_argument("--model", default="resonant-seed-1b", help="Model tier from registry")
     args = parser.parse_args()
 
     # Token from CLI arg or env var
     token = args.token or os.getenv("AUTH_TOKEN", "")
     auth_mode = "JWT" if token else "dev (no auth)"
+    use_real = not args.simulate and REAL_TRAINING_AVAILABLE
+    training_mode = f"REAL ({_DEVICE.upper()})" if use_real else "SIMULATED"
 
     miner_id = args.miner_id or f"miner-louie-{uuid4().hex[:6]}"
 
@@ -382,6 +494,14 @@ async def main():
     print(f"  Mining API:  {args.mining_url}")
     print(f"  Mining WS:   {args.mining_ws}")
     print(f"  Auth:        {auth_mode}")
+    print(f"  Training:    {training_mode}")
+    print(f"  Model:       {args.model}")
+    print(f"  PyTorch:     {'✓ ' + torch.__version__ if REAL_TRAINING_AVAILABLE else '✗ not installed (simulating)'}")
+    if REAL_TRAINING_AVAILABLE and _DEVICE != 'cpu':
+        if _DEVICE == 'cuda':
+            print(f"  GPU:         {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_mem / 1e9:.1f}GB)")
+        elif _DEVICE == 'mps':
+            print(f"  GPU:         Apple Silicon (MPS)")
     print("=" * 60)
     print()
 
@@ -417,6 +537,7 @@ async def main():
             account_email=args.email,
             num_cycles=args.cycles,
             token=token,
+            use_real_training=use_real,
         )
     except Exception as e:
         logger.error(f"  Mining loop failed: {e}")
