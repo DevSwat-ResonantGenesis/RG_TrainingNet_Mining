@@ -48,17 +48,156 @@ from .gradient_compressor import GradientCompressor
 logger = logging.getLogger(__name__)
 
 
+# ══════════════════════════════════════════════════════════════════
+# MODEL REGISTRY — Scaling tiers from Seed to Frontier
+# The network grows the model as more miners + compute join.
+# ══════════════════════════════════════════════════════════════════
+
+MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "resonant-seed-1b": {
+        "model_type": "transformer-gqa",
+        "num_parameters": 1_000_000_000,
+        "hidden_size": 2048,
+        "num_layers": 24,
+        "num_heads": 16,
+        "num_kv_heads": 4,           # GQA: 4 KV heads
+        "intermediate_size": 5504,   # SwiGLU FFN
+        "vocab_size": 128_256,       # BPE 128K (modern tokenizer)
+        "max_seq_length": 4096,
+        "total_training_tokens": 50_000_000_000,     # 50B tokens
+        "min_miners": 1,
+        "min_weight_shards": 4,
+        "min_gpu_vram_gb": 8,
+        "phase": "Phase 2 — Prove distributed training",
+    },
+    "resonant-v1-7b": {
+        "model_type": "transformer-gqa",
+        "num_parameters": 7_000_000_000,
+        "hidden_size": 4096,
+        "num_layers": 32,
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "intermediate_size": 11008,
+        "vocab_size": 128_256,
+        "max_seq_length": 8192,
+        "total_training_tokens": 2_000_000_000_000,  # 2T tokens
+        "min_miners": 10,
+        "min_weight_shards": 14,
+        "min_gpu_vram_gb": 16,
+        "phase": "Phase 4 — First competitive model",
+    },
+    "resonant-v1-13b": {
+        "model_type": "transformer-gqa",
+        "num_parameters": 13_000_000_000,
+        "hidden_size": 5120,
+        "num_layers": 40,
+        "num_heads": 40,
+        "num_kv_heads": 8,
+        "intermediate_size": 13824,
+        "vocab_size": 128_256,
+        "max_seq_length": 8192,
+        "total_training_tokens": 3_000_000_000_000,  # 3T tokens
+        "min_miners": 25,
+        "min_weight_shards": 26,
+        "min_gpu_vram_gb": 24,
+        "phase": "Phase 4 — Mid-scale competitive",
+    },
+    "resonant-v2-70b": {
+        "model_type": "transformer-gqa",
+        "num_parameters": 70_000_000_000,
+        "hidden_size": 8192,
+        "num_layers": 80,
+        "num_heads": 64,
+        "num_kv_heads": 8,
+        "intermediate_size": 28672,
+        "vocab_size": 128_256,
+        "max_seq_length": 16384,
+        "total_training_tokens": 15_000_000_000_000, # 15T tokens
+        "min_miners": 100,
+        "min_weight_shards": 70,
+        "min_gpu_vram_gb": 24,
+        "phase": "Phase 5 — Large-scale",
+    },
+    "resonant-frontier-405b": {
+        "model_type": "transformer-gqa-moe",
+        "num_parameters": 405_000_000_000,
+        "hidden_size": 16384,
+        "num_layers": 126,
+        "num_heads": 128,
+        "num_kv_heads": 16,
+        "intermediate_size": 53248,
+        "vocab_size": 128_256,
+        "max_seq_length": 32768,
+        "total_training_tokens": 30_000_000_000_000, # 30T tokens
+        "min_miners": 500,
+        "min_weight_shards": 405,
+        "min_gpu_vram_gb": 40,
+        "phase": "Phase 6 — Frontier class (MoE)",
+    },
+}
+
+# Training data sources — open, free, permissively licensed
+TRAINING_DATA_SOURCES = {
+    "primary": [
+        {"name": "FineWeb-Edu", "tokens": "1.3T", "license": "ODC-BY", "url": "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu"},
+        {"name": "RedPajama-V2", "tokens": "30T", "license": "Apache 2.0", "url": "https://huggingface.co/datasets/togethercomputer/RedPajama-Data-V2"},
+        {"name": "The Stack v2", "tokens": "900B", "license": "per-repo", "url": "https://huggingface.co/datasets/bigcode/the-stack-v2"},
+        {"name": "StarCoder-Data", "tokens": "783B", "license": "Apache 2.0", "url": "https://huggingface.co/datasets/bigcode/starcoderdata"},
+    ],
+    "reasoning": [
+        {"name": "OpenMathInstruct-2", "samples": "14M", "license": "CC BY 4.0"},
+        {"name": "MetaMathQA", "samples": "395K", "license": "MIT"},
+    ],
+    "alignment": [
+        {"name": "UltraChat-200K", "samples": "200K", "license": "MIT"},
+        {"name": "OpenAssistant-2", "samples": "91K", "license": "Apache 2.0"},
+    ],
+}
+
+
+def get_model_config(model_id: str) -> Optional[Dict[str, Any]]:
+    """Lookup a model config from the registry."""
+    return MODEL_REGISTRY.get(model_id)
+
+
+def get_best_model_for_network(num_miners: int, min_vram_gb: int = 8) -> str:
+    """Pick the largest model the current miner network can train."""
+    best = "resonant-seed-1b"
+    for mid, cfg in MODEL_REGISTRY.items():
+        if num_miners >= cfg["min_miners"] and min_vram_gb >= cfg["min_gpu_vram_gb"]:
+            if cfg["num_parameters"] > MODEL_REGISTRY[best]["num_parameters"]:
+                best = mid
+    return best
+
+
+def list_models() -> List[Dict[str, Any]]:
+    """List all available model tiers."""
+    result = []
+    for mid, cfg in MODEL_REGISTRY.items():
+        result.append({
+            "model_id": mid,
+            "parameters": f"{cfg['num_parameters'] / 1e9:.0f}B",
+            "training_tokens": f"{cfg['total_training_tokens'] / 1e12:.0f}T",
+            "min_miners": cfg["min_miners"],
+            "min_gpu_vram_gb": cfg["min_gpu_vram_gb"],
+            "phase": cfg["phase"],
+        })
+    return result
+
+
 @dataclass
 class SeedModelConfig:
-    """Configuration for the Genesis Seed model."""
+    """Configuration for any model tier. Defaults to seed-1b."""
     model_id: str = "resonant-seed-1b"
-    model_type: str = "gpt2-xl-custom"
-    num_parameters: int = 1_000_000_000  # 1B
+    model_type: str = "transformer-gqa"
+    num_parameters: int = 1_000_000_000
     hidden_size: int = 2048
     num_layers: int = 24
     num_heads: int = 16
-    vocab_size: int = 50257
-    max_seq_length: int = 2048
+    num_kv_heads: int = 4
+    intermediate_size: int = 5504
+    vocab_size: int = 128_256
+    max_seq_length: int = 4096
     dtype: str = "bfloat16"
 
     # Training config
@@ -66,20 +205,51 @@ class SeedModelConfig:
     warmup_steps: int = 2000
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    total_training_tokens: int = 50_000_000_000  # 50B tokens target
+    total_training_tokens: int = 50_000_000_000
 
-    # Sharding
-    num_weight_shards: int = 10  # Split weights across 10 IPFS shards
-    num_data_shards: int = 100   # 100 data shards (1 per miner)
+    # Sharding — auto-calculated from model size and miner count
+    num_weight_shards: int = 10
+    num_data_shards: int = 100
+
+    @classmethod
+    def from_registry(cls, model_id: str, num_miners: int = 100) -> "SeedModelConfig":
+        """Create config from the model registry. Auto-scales sharding."""
+        reg = MODEL_REGISTRY.get(model_id)
+        if not reg:
+            raise ValueError(f"Unknown model: {model_id}. Available: {list(MODEL_REGISTRY.keys())}")
+
+        # Auto-calculate sharding based on model size + miner count
+        params_b = reg["num_parameters"] / 1e9
+        weight_shards = max(4, int(params_b))  # ~1B per shard minimum
+        data_shards = max(num_miners, 100)      # at least 1 shard per miner
+
+        return cls(
+            model_id=model_id,
+            model_type=reg["model_type"],
+            num_parameters=reg["num_parameters"],
+            hidden_size=reg["hidden_size"],
+            num_layers=reg["num_layers"],
+            num_heads=reg["num_heads"],
+            num_kv_heads=reg.get("num_kv_heads", reg["num_heads"] // 4),
+            intermediate_size=reg.get("intermediate_size", reg["hidden_size"] * 4),
+            vocab_size=reg["vocab_size"],
+            max_seq_length=reg["max_seq_length"],
+            total_training_tokens=reg["total_training_tokens"],
+            num_weight_shards=weight_shards,
+            num_data_shards=data_shards,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "model_id": self.model_id,
             "model_type": self.model_type,
             "num_parameters": self.num_parameters,
+            "num_parameters_human": f"{self.num_parameters / 1e9:.0f}B",
             "hidden_size": self.hidden_size,
             "num_layers": self.num_layers,
             "num_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "intermediate_size": self.intermediate_size,
             "vocab_size": self.vocab_size,
             "max_seq_length": self.max_seq_length,
             "dtype": self.dtype,
@@ -88,6 +258,7 @@ class SeedModelConfig:
             "batch_size": self.batch_size,
             "gradient_accumulation_steps": self.gradient_accumulation_steps,
             "total_training_tokens": self.total_training_tokens,
+            "total_training_tokens_human": f"{self.total_training_tokens / 1e12:.1f}T",
             "num_weight_shards": self.num_weight_shards,
             "num_data_shards": self.num_data_shards,
         }

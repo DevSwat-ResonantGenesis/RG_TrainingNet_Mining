@@ -11,7 +11,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 
-from .genesis_seed import genesis_initializer, SeedModelConfig
+from .genesis_seed import (
+    genesis_initializer, SeedModelConfig,
+    MODEL_REGISTRY, TRAINING_DATA_SOURCES,
+    list_models, get_model_config, get_best_model_for_network,
+)
 from .param_server import param_server
 from .training_task import task_manager, GradientSubmission
 from .gradient_compressor import CompressedGradient, verify_gradient_hash
@@ -258,6 +262,34 @@ async def get_miner_rewards(year: int = 1, user: AuthenticatedUser = Depends(get
     """Get calculated rewards for all miners."""
     rewards = param_server.get_miner_rewards(year)
     return {"year": year, "rewards": rewards}
+
+
+# ============== Model Registry ==============
+
+@router.get("/models")
+async def get_models():
+    """List all available model tiers and their requirements."""
+    return {
+        "models": list_models(),
+        "current_model": genesis_initializer.state.model_config.model_id if genesis_initializer.state.model_config else None,
+        "active_miners": len(param_server.miners),
+        "recommended_model": get_best_model_for_network(len(param_server.miners)),
+    }
+
+
+@router.get("/models/{model_id}")
+async def get_model_details(model_id: str):
+    """Get detailed config for a specific model tier."""
+    cfg = get_model_config(model_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}. Use GET /mining/models to list available models.")
+    return {"model_id": model_id, **cfg}
+
+
+@router.get("/training-data")
+async def get_training_data_sources():
+    """List all training data sources used for model training."""
+    return TRAINING_DATA_SOURCES
 
 
 # ============== Health ==============
