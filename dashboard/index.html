@@ -96,14 +96,16 @@
 </div>
 
 <script>
-const API = window.location.origin;
+// Detect base path: if served at /mining/dashboard, API base is /mining
+const pathParts = window.location.pathname.split('/').filter(Boolean);
+const BASE = pathParts.length > 1 ? '/' + pathParts[0] : '';
 let data = null;
 
 async function fetchData() {
   try {
     const [dashRes, blocksRes] = await Promise.all([
-      fetch(`${API}/dashboard/data`),
-      fetch(`${API}/dashboard/blocks?limit=8`),
+      fetch(`${BASE}/dashboard/data`),
+      fetch(`${BASE}/dashboard/blocks?limit=8`),
     ]);
     const dash = await dashRes.json();
     const blocks = await blocksRes.json();
