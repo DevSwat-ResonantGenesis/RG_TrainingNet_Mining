@@ -27,12 +27,19 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 EXTERNAL_BLOCKCHAIN_URL = os.getenv("EXTERNAL_BLOCKCHAIN_URL", "http://localhost:8702")
 LIGHTHOUSE_URL = os.getenv("LIGHTHOUSE_URL", "http://localhost:8700")
+INTERNAL_SERVICE_KEY = os.getenv("AUTH_INTERNAL_SERVICE_KEY", "")
+
+
+def _auth_headers() -> Dict[str, str]:
+    if INTERNAL_SERVICE_KEY:
+        return {"X-Internal-Key": INTERNAL_SERVICE_KEY}
+    return {}
 
 
 async def _fetch(url: str, timeout: float = 5.0) -> Dict:
     """Fetch JSON from a URL, return empty dict on failure."""
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, headers=_auth_headers()) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
                 return resp.json()
