@@ -787,6 +787,149 @@ class ShardManager:
         )
         return assignment
 
+    # ── Liquid Redistribution ──
+
+    def liquid_redistribute(self, group_id: str) -> List[ShardAssignment]:
+        """
+        Automatically redistribute orphaned stages to available miners.
+        
+        Like liquid flowing to fill a gap — when a miner disconnects,
+        its shard flows to the best available replacement miner.
+        
+        Algorithm:
+        1. Find empty stages in the degraded pipeline
+        2. For each empty stage, find best available miner
+        3. Reassign the shard and re-link upstream/downstream
+        4. If pipeline is fully repaired, transition back to LOADING
+        
+        Returns list of new assignments (empty if no miners available).
+        """
+        group = self.pipeline_groups.get(group_id)
+        if not group or group.status != PipelineStatus.DEGRADED:
+            return []
+
+        model_config = self._model_configs.get(group.model_id, {})
+        if not model_config:
+            return []
+
+        new_assignments = []
+
+        # Find empty stages
+        for stage_idx in range(group.num_stages):
+            if stage_idx in group.stages:
+                continue  # Stage is filled
+
+            # Find best replacement miner
+            replacement = self._find_best_replacement(
+                group, stage_idx, model_config
+            )
+            if not replacement:
+                logger.warning(
+                    f"No available miner to fill stage {stage_idx} "
+                    f"of pipeline {group_id}"
+                )
+                continue
+
+            assignment = self.reassign_shard(group_id, stage_idx, replacement.miner_id)
+            if assignment:
+                new_assignments.append(assignment)
+                logger.info(
+                    f"Liquid redistribution: stage {stage_idx} of {group_id} "
+                    f"→ miner {replacement.miner_id} "
+                    f"({replacement.gpu_model}, {replacement.gpu_vram_gb:.1f}GB)"
+                )
+
+        # Check if pipeline is fully repaired
+        if group.is_complete:
+            group.status = PipelineStatus.LOADING
+            logger.info(f"Pipeline {group_id} repaired — all stages filled, status=LOADING")
+
+        return new_assignments
+
+    def _find_best_replacement(
+        self,
+        group: 'PipelineGroup',
+        stage_index: int,
+        model_config: Dict[str, Any],
+    ) -> Optional[MinerCapability]:
+        """
+        Find the best available miner to fill an empty pipeline stage.
+        
+        Scoring:
+          - Must have enough VRAM for the shard
+          - Prefer same region as neighbors (lower P2P latency)
+          - Prefer higher VRAM (more headroom)
+          - Prefer lower current load
+        """
+        num_layers = model_config["num_layers"]
+        layer_ranges = self.compute_layer_assignment(num_layers, group.num_stages)
+        if stage_index >= len(layer_ranges):
+            return None
+
+        layer_start, layer_end = layer_ranges[stage_index]
+        shard_bytes, _ = self.compute_shard_size(
+            model_config, layer_start, layer_end,
+            has_embedding=(stage_index == 0),
+            has_lm_head=(stage_index == group.num_stages - 1),
+        )
+
+        # Minimum VRAM needed (shard + activations + optimizer)
+        min_vram_gb = shard_bytes * 4 / 1e9  # 4x for params+grads+optimizer+activations
+
+        available = self.get_available_miners(min_vram_gb=min_vram_gb)
+        if not available:
+            # Try with relaxed VRAM requirement
+            available = self.get_available_miners()
+
+        if not available:
+            return None
+
+        # Find neighbor regions for locality preference
+        neighbor_regions = set()
+        for adj_stage in (stage_index - 1, stage_index + 1):
+            adj = group.stages.get(adj_stage)
+            if adj:
+                adj_miner = self.miners.get(adj.miner_id)
+                if adj_miner:
+                    neighbor_regions.add(adj_miner.location_region)
+
+        def score_miner(m: MinerCapability) -> Tuple:
+            """Higher score = better candidate. Returns tuple for sorting."""
+            region_match = 1 if m.location_region in neighbor_regions else 0
+            return (region_match, m.gpu_vram_gb, -self.miner_shards_count(m.miner_id))
+
+        available.sort(key=score_miner, reverse=True)
+        return available[0]
+
+    def miner_shards_count(self, miner_id: str) -> int:
+        """Count how many shard assignments a miner currently holds."""
+        return 1 if miner_id in self.miner_assignments else 0
+
+    def auto_heal_degraded_pipelines(self) -> Dict[str, List[ShardAssignment]]:
+        """
+        Scan all degraded pipelines and attempt to heal them.
+        
+        Called periodically (e.g., every 30s) or on miner connect.
+        Returns map of group_id → new assignments.
+        """
+        healed = {}
+        degraded = [
+            g for g in self.pipeline_groups.values()
+            if g.status == PipelineStatus.DEGRADED
+        ]
+
+        for group in degraded:
+            new_assignments = self.liquid_redistribute(group.group_id)
+            if new_assignments:
+                healed[group.group_id] = new_assignments
+
+        if healed:
+            logger.info(
+                f"Auto-heal: repaired {len(healed)} pipelines, "
+                f"{sum(len(a) for a in healed.values())} stages reassigned"
+            )
+        return healed
+
     # ── Statistics ──
 
     def get_stats(self) -> Dict[str, Any]:

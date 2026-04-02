@@ -422,6 +422,332 @@ async def get_pipeline_peers(miner_id: str):
     }
 
 
+# ============== Network-Native Model (Weight Registry + Shard Slicer) ==============
+
+from .weight_shard_registry import (
+    weight_registry, ShardLocation, ShardState, ReplicaPriority,
+)
+from .shard_slicer import shard_slicer, WeightTransferRequest, create_transfer_plan
+from fastapi.responses import StreamingResponse
+import asyncio
+import json as _json
+
+
+class WeightTransferRequestModel(BaseModel):
+    miner_id: str
+    model_id: str
+    layer_start: int
+    layer_end: int
+    include_embedding: bool = False
+    include_lm_head: bool = False
+    preferred_source: str = ""
+
+
+class ShardLoadedReport(BaseModel):
+    miner_id: str
+    model_id: str
+    layer_start: int
+    layer_end: int
+    weight_hash: str
+    size_bytes: int = 0
+    num_params: int = 0
+    miner_address: str = ""
+
+
+class ShardIntegrityCheck(BaseModel):
+    miner_id: str
+    shard_key: str
+    reported_hash: str
+    global_step: int = 0
+
+
+@router.get("/weights/model-status/{model_id}")
+async def network_model_status(model_id: str):
+    """
+    Full status of a network-native model — the 'GPS' of weights across the swarm.
+    Shows which shards live where, replication health, and on-chain version.
+    """
+    return weight_registry.get_network_model_status(model_id)
+
+
+@router.get("/weights/shard-map/{model_id}")
+async def get_shard_map(model_id: str):
+    """
+    Get the complete shard map — which layers live on which miners.
+    This is the 'DNS' of the model across the network.
+    """
+    return {
+        "model_id": model_id,
+        "shard_map": weight_registry.get_shard_map(model_id),
+        "replication": weight_registry.get_replication_status(model_id),
+    }
+
+
+@router.post("/weights/request-transfer")
+async def request_weight_transfer(req: WeightTransferRequestModel):
+    """
+    Request a transfer plan for downloading specific layer weights.
+    
+    Returns an ordered list of sources (peers + fallback seed slicer)
+    that the miner should try to pull weights from.
+    """
+    transfer_req = WeightTransferRequest(
+        requester_miner_id=req.miner_id,
+        model_id=req.model_id,
+        layer_start=req.layer_start,
+        layer_end=req.layer_end,
+        include_embedding=req.include_embedding,
+        include_lm_head=req.include_lm_head,
+        preferred_source=req.preferred_source,
+    )
+    plan = create_transfer_plan(transfer_req, weight_registry, shard_manager)
+    return plan.to_dict()
+
+
+@router.get("/weights/stream/{model_id}")
+async def stream_weight_slice(
+    model_id: str,
+    layer_start: int = 0,
+    layer_end: int = 0,
+    include_embedding: bool = False,
+    include_lm_head: bool = False,
+):
+    """
+    Stream specific layer weights as chunked response.
+    
+    This is the seed slicer endpoint — the fallback when no P2P peer
+    has the requested shard. Miners should prefer P2P transfers.
+    """
+    manifest = shard_slicer.create_manifest(
+        model_id, layer_start, layer_end,
+        include_embedding, include_lm_head,
+    )
+    if not manifest:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cached weights for {model_id} layers {layer_start}-{layer_end}"
+        )
+
+    return {"manifest": manifest.to_dict()}
+
+
+@router.post("/weights/report-loaded")
+async def report_shard_loaded(req: ShardLoadedReport):
+    """
+    Miner reports it has finished loading/downloading a weight shard.
+    
+    This registers the shard in the weight registry, making this miner
+    a source for P2P weight transfers to other miners.
+    """
+    location = ShardLocation(
+        model_id=req.model_id,
+        miner_id=req.miner_id,
+        layer_start=req.layer_start,
+        layer_end=req.layer_end,
+        weight_hash=req.weight_hash,
+        state=ShardState.LOADED,
+        priority=ReplicaPriority.PRIMARY,
+        size_bytes=req.size_bytes,
+        num_params=req.num_params,
+        miner_address=req.miner_address,
+    )
+    result = weight_registry.register_shard(location)
+
+    # Also report shard ready in shard_manager
+    shard_manager.report_shard_ready(req.miner_id)
+
+    return {
+        "status": "registered",
+        "location_id": result.location_id,
+        "shard_key": result.shard_key,
+        "replicas": len(weight_registry.shard_replicas.get(result.shard_key, set())),
+    }
+
+
+@router.post("/weights/verify-integrity")
+async def verify_shard_integrity(req: ShardIntegrityCheck):
+    """
+    Verify a miner's shard weights match the on-chain expected hash.
+    Used to detect weight corruption, tampering, or desync.
+    """
+    valid = weight_registry.verify_shard_integrity(
+        req.miner_id, req.shard_key, req.reported_hash, req.global_step
+    )
+    return {"valid": valid, "shard_key": req.shard_key, "miner_id": req.miner_id}
+
+
+@router.post("/weights/snapshot/{model_id}")
+async def create_weight_snapshot(
+    model_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Create an on-chain version snapshot — Merkle root of all shard hashes.
+    
+    This anchors the current model state on the blockchain, creating an
+    immutable audit trail. Any miner can verify its weights match.
+    """
+    check_rate_limit(user.user_id or "anon", "default")
+    version = weight_registry.create_version_snapshot(model_id, param_server.global_step)
+
+    # Anchor on-chain (fire-and-forget)
+    asyncio.create_task(chain_bridge.record_aggregation_on_chain(
+        global_step=param_server.global_step,
+        layers_merged=version.num_shards,
+        miners_contributed=len(weight_registry.miner_shards),
+    ))
+
+    return version.to_dict()
+
+
+@router.get("/weights/registry-stats")
+async def weight_registry_stats():
+    """Weight shard registry statistics."""
+    return weight_registry.get_stats()
+
+
+@router.get("/weights/miner-shards/{miner_id}")
+async def get_miner_weight_shards(miner_id: str):
+    """Get all weight shards held by a specific miner."""
+    shards = weight_registry.get_miner_shards(miner_id)
+    return {
+        "miner_id": miner_id,
+        "shards": [s.to_dict() for s in shards],
+        "count": len(shards),
+    }
+
+
+@router.get("/weights/find-sources/{model_id}")
+async def find_weight_sources(
+    model_id: str,
+    layer_start: int = 0,
+    layer_end: int = 0,
+):
+    """Find all miners that can serve specific layer weights."""
+    sources = weight_registry.find_shard_sources(model_id, layer_start, layer_end)
+    return {
+        "model_id": model_id,
+        "layer_range": f"{layer_start}-{layer_end}",
+        "sources": [s.to_dict() for s in sources],
+        "count": len(sources),
+    }
+
+
+# ============== Liquid Redistribution ==============
+
+@router.post("/shards/auto-heal")
+async def auto_heal_pipelines(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Trigger automatic healing of all degraded pipelines.
+    
+    Scans for DEGRADED pipelines and reassigns orphaned stages
+    to available miners. Like liquid flowing to fill gaps.
+    """
+    check_rate_limit(user.user_id or "anon", "default")
+    healed = shard_manager.auto_heal_degraded_pipelines()
+    return {
+        "healed_pipelines": len(healed),
+        "total_reassignments": sum(len(a) for a in healed.values()),
+        "details": {
+            gid: [a.to_dict() for a in assignments]
+            for gid, assignments in healed.items()
+        },
+    }
+
+
+@router.post("/weights/redistribute/{model_id}")
+async def redistribute_weights(
+    model_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Plan and execute weight redistribution for under-replicated shards.
+    
+    When miners disconnect, their shards become orphaned. This endpoint
+    plans optimal redistribution to maintain the replication policy.
+    """
+    check_rate_limit(user.user_id or "anon", "default")
+
+    available = [
+        {
+            "miner_id": m.miner_id,
+            "gpu_vram_gb": m.gpu_vram_gb,
+            "address": f"{m.location_region}",
+            "bandwidth_mbps": m.bandwidth_mbps,
+        }
+        for m in shard_manager.get_available_miners()
+    ]
+
+    plan = weight_registry.plan_redistribution(model_id, available)
+    return {
+        "model_id": model_id,
+        "transfers_planned": len(plan),
+        "plan": plan,
+    }
+
+
+# ============== Unified Inference Router ==============
+
+@router.post("/inference/route")
+async def route_inference(
+    model_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Get the inference routing plan for a model.
+    
+    Returns the ordered pipeline stages with miner addresses,
+    so the caller can send input to stage 0 and collect output
+    from the last stage. The model runs across all miners as one.
+    """
+    check_rate_limit(user.user_id or "anon", "default")
+
+    # Find an active pipeline group for this model
+    active_group = None
+    for group in shard_manager.pipeline_groups.values():
+        if group.model_id == model_id and group.status.value in ("ready", "training"):
+            active_group = group
+            break
+
+    if not active_group:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active pipeline for model {model_id}. "
+            f"Available groups: {len(shard_manager.pipeline_groups)}"
+        )
+
+    stages = []
+    for stage_idx in range(active_group.num_stages):
+        assignment = active_group.stages.get(stage_idx)
+        if not assignment:
+            stages.append({"stage": stage_idx, "status": "missing"})
+            continue
+
+        miner = shard_manager.miners.get(assignment.miner_id)
+        stages.append({
+            "stage": stage_idx,
+            "miner_id": assignment.miner_id,
+            "layer_start": assignment.layer_start,
+            "layer_end": assignment.layer_end,
+            "has_embedding": assignment.has_embedding,
+            "has_lm_head": assignment.has_lm_head,
+            "miner_address": miner.location_region if miner else "unknown",
+            "status": assignment.status,
+        })
+
+    return {
+        "model_id": model_id,
+        "pipeline_group_id": active_group.group_id,
+        "num_stages": active_group.num_stages,
+        "status": active_group.status.value,
+        "stages": stages,
+        "entry_point": stages[0] if stages else None,
+        "exit_point": stages[-1] if stages else None,
+    }
+
+
 # ============== Health ==============
 
 @router.get("/health")
@@ -437,5 +763,11 @@ async def health():
             "total_miners": len(shard_manager.miners),
             "pipeline_groups": len(shard_manager.pipeline_groups),
             "assigned_miners": len(shard_manager.miner_assignments),
+        },
+        "weight_registry": {
+            "total_locations": len(weight_registry.locations),
+            "unique_shards": len(weight_registry.shard_replicas),
+            "miners_with_shards": len(weight_registry.miner_shards),
+            "latest_version": weight_registry.latest_version,
         },
     }

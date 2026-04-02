@@ -42,6 +42,7 @@ from .auth_middleware import get_ws_user, check_rate_limit, AuthenticatedUser
 from .chain_bridge import chain_bridge
 from .shard_manager import shard_manager
 from .sharded_param_server import sharded_param_server
+from .weight_shard_registry import weight_registry
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,13 @@ async def handle_mining_ws(ws: WebSocket):
     finally:
         if miner_id:
             await ws_manager.disconnect(miner_id)
-            # Notify ShardManager — may mark pipeline group as DEGRADED
+
+            # 1. Orphan weight shards in the registry
+            orphaned = weight_registry.orphan_miner_shards(miner_id)
+            if orphaned:
+                logger.info(f"WS: Orphaned {len(orphaned)} weight shards from {miner_id}")
+
+            # 2. Notify ShardManager — may mark pipeline group as DEGRADED
             affected_group = shard_manager.handle_miner_disconnect(miner_id)
             if affected_group:
                 logger.warning(
@@ -267,6 +274,27 @@ async def handle_mining_ws(ws: WebSocket):
                                 "disconnected_stage": stage.stage_index,
                                 "group_status": group.status.value,
                             })
+
+                # 3. Liquid redistribution — auto-heal the degraded pipeline
+                new_assignments = shard_manager.liquid_redistribute(affected_group)
+                for assignment in new_assignments:
+                    # Notify the replacement miner to download its shard
+                    await ws_manager.send_to_miner(assignment.miner_id, {
+                        "event": "shard_assigned",
+                        "pipeline_group_id": affected_group,
+                        "stage_index": assignment.stage_index,
+                        "layer_start": assignment.layer_start,
+                        "layer_end": assignment.layer_end,
+                        "has_embedding": assignment.has_embedding,
+                        "has_lm_head": assignment.has_lm_head,
+                        "upstream_miner_id": assignment.upstream_miner_id,
+                        "downstream_miner_id": assignment.downstream_miner_id,
+                        "reason": "liquid_redistribution",
+                    })
+                    logger.info(
+                        f"WS: Liquid redistribution — stage {assignment.stage_index} "
+                        f"→ miner {assignment.miner_id}"
+                    )
 
 
 async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):
