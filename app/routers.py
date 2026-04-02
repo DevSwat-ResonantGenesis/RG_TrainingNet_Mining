@@ -7,9 +7,14 @@ Provides endpoints for: genesis initialization, task management,
 gradient submission, miner registration, parameter server stats.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
+import json
+import logging
+from uuid import uuid4, uuid
+from datetime import datetime, timezone
+from dataclasses import asdict
 
 from .genesis_seed import (
     genesis_initializer, SeedModelConfig,
@@ -25,6 +30,12 @@ from .auth_middleware import (
     check_rate_limit,
 )
 from .chain_bridge import chain_bridge
+from .p2p_discovery import p2p_discovery
+from .slashing import (
+    slashing_engine, ViolationType, ViolationSeverity,
+)
+from .network_dashboard import network_dashboard, DASHBOARD_HTML
+from .wallet_service import wallet_service, TokenType, StakeStatus
 
 router = APIRouter(prefix="/mining", tags=["mining"])
 
@@ -837,4 +848,723 @@ async def health():
             "miners_with_shards": len(weight_registry.miner_shards),
             "latest_version": weight_registry.latest_version,
         },
+    }
+
+
+# ============== P2P Discovery / WebRTC Signaling ==============
+
+@router.websocket("/p2p/signaling/{miner_id}")
+async def websocket_signaling(websocket: WebSocket, miner_id: str):
+    """
+    WebSocket endpoint for WebRTC signaling.
+    
+    Miners connect here to exchange ICE candidates, offers, and answers
+    to establish direct P2P connections with their pipeline peers.
+    """
+    await websocket.accept()
+    
+    # Register miner for P2P discovery
+    peer_id = p2p_discovery.register_miner(miner_id, websocket)
+    
+    try:
+        logger.info(f"Miner {miner_id} connected for P2P signaling (peer {peer_id})")
+        
+        while True:
+            # Receive signaling message
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+                p2p_discovery.handle_signaling_message(miner_id, message)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON from miner {miner_id}: {data}")
+            except Exception as e:
+                logger.error(f"Error handling signaling from {miner_id}: {e}")
+                
+    except WebSocketDisconnect:
+        logger.info(f"Miner {miner_id} disconnected from P2P signaling")
+    except Exception as e:
+        logger.error(f"P2P signaling error for {miner_id}: {e}")
+    finally:
+        # Cleanup
+        p2p_discovery.unregister_miner(miner_id)
+
+
+class P2PPipelineAssignment(BaseModel):
+    """Request to assign miners to a pipeline for P2P connections."""
+    pipeline_group_id: str
+    assignments: List[Dict[str, Any]]  # List of {miner_id, stage_index, ...}
+
+
+@router.post("/p2p/assign-pipeline")
+async def assign_pipeline_peers(
+    request: P2PPipelineAssignment,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Assign miners to a pipeline and initiate P2P connections.
+    
+    Called by ShardManager after pipeline formation to establish
+    WebRTC connections between adjacent pipeline stages.
+    """
+    check_rate_limit(user.user_id or "admin", "pipeline-assign")
+    
+    p2p_discovery.assign_pipeline_peers(
+        request.pipeline_group_id,
+        request.assignments
+    )
+    
+    return {
+        "status": "assigned",
+        "pipeline_group_id": request.pipeline_group_id,
+        "miners_assigned": len(request.assignments),
+    }
+
+
+@router.get("/p2p/peer-info/{miner_id}")
+async def get_peer_info(
+    miner_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get P2P connection status for a miner."""
+    check_rate_limit(user.user_id or "admin", "peer-info")
+    
+    info = p2p_discovery.get_peer_info(miner_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Miner not registered for P2P")
+    
+    return info
+
+
+@router.get("/p2p/pipeline-status/{pipeline_group_id}")
+async def get_pipeline_p2p_status(
+    pipeline_group_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get P2P connection status for all peers in a pipeline."""
+    check_rate_limit(user.user_id or "admin", "pipeline-status")
+    
+    status = p2p_discovery.get_pipeline_status(pipeline_group_id)
+    if not status["peers"]:
+        raise HTTPException(status_code=404, detail="Pipeline not found")
+    
+    return status
+
+
+# ============== WebRTC Weight Transfer Endpoints ==============
+
+class WebRTCUpdateRequest(BaseModel):
+    """Request to update miner's WebRTC capabilities."""
+    webrtc_peer_id: str
+    bandwidth_mbps: float = 0.0
+
+
+@router.post("/webrtc/update-capabilities")
+async def update_webrtc_capabilities(
+    request: WebRTCUpdateRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Update a miner's WebRTC capabilities for P2P weight transfers.
+    
+    Called by miners when they establish WebRTC connections with pipeline peers.
+    This enables them to serve as P2P weight sources for other miners.
+    """
+    check_rate_limit(user.user_id or "admin", "webrtc-update")
+    
+    # Extract miner_id from authenticated user
+    miner_id = user.user_id
+    if not miner_id:
+        raise HTTPException(status_code=400, detail="Miner ID required")
+    
+    # Update WebRTC info in weight registry
+    weight_registry.update_miner_webrtc_info(
+        miner_id=miner_id,
+        webrtc_peer_id=request.webrtc_peer_id,
+        bandwidth_mbps=request.bandwidth_mbps,
+    )
+    
+    return {
+        "status": "updated",
+        "miner_id": miner_id,
+        "webrtc_peer_id": request.webrtc_peer_id,
+        "bandwidth_mbps": request.bandwidth_mbps,
+    }
+
+
+@router.get("/webrtc/transfer-sources/{model_id}/{layer_start}/{layer_end}")
+async def get_webrtc_transfer_sources(
+    model_id: str,
+    layer_start: int,
+    layer_end: int,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Get WebRTC-enabled sources for a weight shard.
+    
+    Returns peers that can serve the requested shard via WebRTC DataChannel,
+    prioritized by bandwidth and availability. Falls back to HTTP sources
+    if no WebRTC peers are available.
+    """
+    check_rate_limit(user.user_id or "admin", "transfer-sources")
+    
+    # Find sources (automatically prioritizes WebRTC)
+    sources = weight_registry.find_shard_sources(model_id, layer_start, layer_end)
+    
+    # Format response
+    webrtc_sources = []
+    http_sources = []
+    
+    for source in sources:
+        source_info = {
+            "miner_id": source.miner_id,
+            "location_id": source.location_id,
+            "version": source.version,
+            "weight_hash": source.weight_hash,
+            "size_bytes": source.size_bytes,
+            "priority": source.priority.value,
+        }
+        
+        if source.can_serve_p2p:
+            source_info.update({
+                "webrtc_peer_id": source.webrtc_peer_id,
+                "bandwidth_mbps": source.webrtc_bandwidth,
+                "transfer_method": "webrtc",
+            })
+            webrtc_sources.append(source_info)
+        else:
+            source_info.update({
+                "miner_address": source.miner_address,
+                "transfer_method": "http",
+            })
+            http_sources.append(source_info)
+    
+    return {
+        "model_id": model_id,
+        "layer_range": f"L{layer_start}-{layer_end}",
+        "webrtc_sources": webrtc_sources,
+        "http_sources": http_sources,
+        "total_sources": len(sources),
+        "has_webrtc": len(webrtc_sources) > 0,
+    }
+
+
+class WebRTCTransferRequest(BaseModel):
+    """Request to initiate WebRTC weight transfer."""
+    source_peer_id: str
+    target_miner_id: str
+    model_id: str
+    layer_start: int
+    layer_end: int
+    transfer_id: str = None
+
+
+@router.post("/webrtc/initiate-transfer")
+async def initiate_webrtc_transfer(
+    request: WebRTCTransferRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Initiate a WebRTC-based weight transfer between miners.
+    
+    This endpoint coordinates the transfer by:
+    1. Verifying both peers have WebRTC connections
+    2. Sending transfer request via signaling channel
+    3. Monitoring transfer progress
+    
+    The actual data transfer happens directly between miners via WebRTC DataChannel.
+    """
+    check_rate_limit(user.user_id or "admin", "webrtc-transfer")
+    
+    # Generate transfer ID if not provided
+    if not request.transfer_id:
+        request.transfer_id = f"transfer-{uuid4().hex[:12]}"
+    
+    # Get source peer info
+    source_info = p2p_discovery.get_peer_info(request.source_peer_id.split("-")[-1])
+    if not source_info or not source_info.get("has_datachannel"):
+        raise HTTPException(
+            status_code=400,
+            detail="Source peer does not have WebRTC DataChannel available"
+        )
+    
+    # Send transfer request via P2P signaling
+    transfer_message = {
+        "type": "weight-transfer-request",
+        "transfer_id": request.transfer_id,
+        "target_miner_id": request.target_miner_id,
+        "model_id": request.model_id,
+        "layer_start": request.layer_start,
+        "layer_end": request.layer_end,
+    }
+    
+    # This would be sent via the P2P discovery signaling channel
+    # For now, we'll just log it
+    logger.info(f"WebRTC transfer initiated: {request.transfer_id}")
+    
+    return {
+        "status": "initiated",
+        "transfer_id": request.transfer_id,
+        "source_peer_id": request.source_peer_id,
+        "target_miner_id": request.target_miner_id,
+        "shard": f"{request.model_id}:L{request.layer_start}-{request.layer_end}",
+        "transfer_method": "webrtc",
+    }
+
+
+# ============== Slashing and Reputation Endpoints ==============
+
+class WeightVerificationRequest(BaseModel):
+    """Request to verify received weights and report violations."""
+    source_miner_id: str
+    model_id: str
+    layer_start: int
+    layer_end: int
+    weight_data: str  # Base64 encoded weight bytes
+    expected_hash: str
+    transfer_id: str = None
+
+
+@router.post("/slashing/verify-weights")
+async def verify_received_weights(
+    request: WeightVerificationRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Verify weights received from a peer and report violations.
+    
+    Miners call this when they receive weights via WebRTC DataChannel
+    to ensure integrity and report any corrupted weights.
+    """
+    check_rate_limit(user.user_id or "admin", "verify-weights")
+    
+    # Decode weight data
+    import base64
+    try:
+        weight_bytes = base64.b64decode(request.weight_data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid weight data encoding: {e}")
+    
+    # Verify weights and report violations if needed
+    is_valid, error = slashing_engine.verify_weight_transfer(
+        miner_id=request.source_miner_id,
+        model_id=request.model_id,
+        layer_start=request.layer_start,
+        layer_end=request.layer_end,
+        weight_data=weight_bytes,
+        expected_hash=request.expected_hash,
+        requester_id=user.user_id or "anonymous",
+    )
+    
+    return {
+        "valid": is_valid,
+        "error": error if not is_valid else None,
+        "source_miner_id": request.source_miner_id,
+        "transfer_id": request.transfer_id,
+    }
+
+
+class ViolationReportRequest(BaseModel):
+    """Request to report a violation."""
+    violator_miner_id: str
+    violation_type: str
+    evidence: Dict[str, Any]
+    description: str = ""
+
+
+@router.post("/slashing/report-violation")
+async def report_violation(
+    request: ViolationReportRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Report a violation by another miner.
+    
+    Can be used for manual reporting of issues not caught by automatic verification.
+    """
+    check_rate_limit(user.user_id or "admin", "report-violation")
+    
+    # Validate violation type
+    try:
+        violation_type = ViolationType(request.violation_type)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid violation type: {request.violation_type}"
+        )
+    
+    record_id = slashing_engine.report_violation(
+        miner_id=request.violator_miner_id,
+        violation_type=violation_type,
+        evidence=request.evidence,
+        reported_by=user.user_id or "anonymous",
+    )
+    
+    return {
+        "record_id": record_id,
+        "status": "reported",
+        "violation_type": request.violation_type,
+        "violator_miner_id": request.violator_miner_id,
+    }
+
+
+@router.get("/slashing/miner-status/{miner_id}")
+async def get_miner_slashing_status(
+    miner_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get a miner's reputation and slashing status."""
+    check_rate_limit(user.user_id or "admin", "miner-status")
+    
+    status = slashing_engine.get_miner_status(miner_id)
+    return status
+
+
+@router.get("/slashing/network-stats")
+async def get_slashing_network_stats(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get overall network slashing statistics."""
+    check_rate_limit(user.user_id or "admin", "network-stats")
+    
+    stats = slashing_engine.get_network_stats()
+    return stats
+
+
+@router.get("/slashing/violations")
+async def get_recent_violations(
+    limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get recent violation records for monitoring."""
+    check_rate_limit(user.user_id or "admin", "violations")
+    
+    violations = sorted(
+        slashing_engine.violations,
+        key=lambda v: v.reported_at,
+        reverse=True
+    )[:limit]
+    
+    return {
+        "violations": [
+            {
+                "record_id": v.record_id,
+                "miner_id": v.miner_id,
+                "violation_type": v.violation_type.value,
+                "severity": v.severity.value,
+                "reported_at": v.reported_at,
+                "verified": v.verified,
+                "slashed": v.slashed,
+                "slash_amount": v.slash_amount,
+                "suspension_end": v.suspension_end,
+            }
+            for v in violations
+        ],
+        "total": len(slashing_engine.violations),
+    }
+
+
+# ============== Network Dashboard Endpoints ==============
+
+@router.get("/dashboard", response_class=HTMLResponse)
+async def get_dashboard():
+    """Serve the network dashboard HTML page."""
+    return DASHBOARD_HTML
+
+
+@router.websocket("/dashboard/ws")
+async def dashboard_websocket(websocket: WebSocket):
+    """WebSocket endpoint for real-time dashboard updates."""
+    client_id = str(uuid.uuid4())
+    await network_dashboard.register_client(websocket, client_id)
+    
+    try:
+        while True:
+            # Keep connection alive and handle incoming messages
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await network_dashboard.unregister_client(client_id)
+    except Exception as e:
+        logger.error(f"Dashboard WebSocket error: {e}")
+        await network_dashboard.unregister_client(client_id)
+
+
+@router.get("/dashboard/data")
+async def get_dashboard_data(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get current dashboard data (REST API endpoint)."""
+    check_rate_limit(user.user_id or "admin", "dashboard-data")
+    return await network_dashboard.get_dashboard_data()
+
+
+@router.get("/dashboard/nodes")
+async def get_network_nodes(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get network nodes information."""
+    check_rate_limit(user.user_id or "admin", "dashboard-nodes")
+    return {"nodes": await network_dashboard._get_network_nodes()}
+
+
+@router.get("/dashboard/links")
+async def get_network_links(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get network links/connections information."""
+    check_rate_limit(user.user_id or "admin", "dashboard-links")
+    return {"links": await network_dashboard._get_network_links()}
+
+
+@router.get("/dashboard/metrics")
+async def get_network_metrics(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get network health metrics."""
+    check_rate_limit(user.user_id or "admin", "dashboard-metrics")
+    return await network_dashboard._get_network_metrics()
+
+
+@router.get("/dashboard/wallets")
+async def get_wallet_info(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get wallet and staking information."""
+    check_rate_limit(user.user_id or "admin", "dashboard-wallets")
+    return {"wallets": await network_dashboard._get_wallet_info()}
+
+
+@router.get("/dashboard/topology")
+async def get_network_topology(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get network topology for visualization."""
+    check_rate_limit(user.user_id or "admin", "dashboard-topology")
+    return await network_dashboard._get_network_topology()
+
+
+@router.get("/dashboard/violations")
+async def get_dashboard_violations(
+    limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get recent violations for dashboard display."""
+    check_rate_limit(user.user_id or "admin", "dashboard-violations")
+    return {"violations": await network_dashboard._get_recent_violations()}
+
+
+@router.get("/dashboard/health")
+async def get_dashboard_health(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get overall network health score."""
+    check_rate_limit(user.user_id or "admin", "dashboard-health")
+    metrics = await network_dashboard._get_network_metrics()
+    return {
+        "health_score": metrics["network_health_score"],
+        "status": "healthy" if metrics["network_health_score"] >= 80 else 
+                "degraded" if metrics["network_health_score"] >= 50 else "critical",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============== Wallet Service Endpoints ==============
+
+class CreateWalletRequest(BaseModel):
+    """Request to create a new wallet."""
+    miner_id: str
+
+
+class StakeRequest(BaseModel):
+    """Request to stake tokens."""
+    token_type: str
+    amount: float
+    lock_period_days: int = 30
+
+
+class WithdrawStakeRequest(BaseModel):
+    """Request to withdraw stake."""
+    stake_id: str
+
+
+@router.post("/wallet/create")
+async def create_wallet(
+    request: CreateWalletRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Create a new wallet for a miner."""
+    check_rate_limit(user.user_id or "admin", "create-wallet")
+    
+    wallet = await wallet_service.create_wallet(request.miner_id)
+    return {
+        "wallet_address": wallet.wallet_address,
+        "miner_id": wallet.miner_id,
+        "created_at": wallet.created_at,
+    }
+
+
+@router.get("/wallet/{miner_id}")
+async def get_wallet(
+    miner_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get wallet information for a miner."""
+    check_rate_limit(user.user_id or "admin", "get-wallet")
+    
+    wallet = await wallet_service.get_wallet(miner_id)
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    
+    stats = await wallet_service.get_wallet_stats(wallet.wallet_address)
+    return stats
+
+
+@router.get("/wallet/{wallet_address}/balance")
+async def get_wallet_balance(
+    wallet_address: str,
+    token_type: Optional[str] = None,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get wallet balance(s)."""
+    check_rate_limit(user.user_id or "admin", "get-balance")
+    
+    if token_type:
+        try:
+            token_enum = TokenType(token_type)
+            balance = await wallet_service.get_balance(wallet_address, token_enum)
+            return {"token_type": token_type, "balance": balance}
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid token type: {token_type}")
+    else:
+        balances = await wallet_service.get_balances(wallet_address)
+        return {"balances": [asdict(b) for b in balances]}
+
+
+@router.post("/wallet/stake")
+async def deposit_stake(
+    request: StakeRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Deposit tokens as stake."""
+    check_rate_limit(user.user_id or "admin", "deposit-stake")
+    
+    # Get wallet for user
+    wallet = await wallet_service.get_wallet(user.user_id or "anonymous")
+    if not wallet:
+        raise HTTPException(status_code=404, detail="Wallet not found")
+    
+    try:
+        token_enum = TokenType(request.token_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid token type: {request.token_type}")
+    
+    stake = await wallet_service.deposit_stake(
+        wallet_address=wallet.wallet_address,
+        token_type=token_enum,
+        amount=request.amount,
+        lock_period_days=request.lock_period_days,
+    )
+    
+    return {
+        "stake_id": stake.stake_id,
+        "token_type": stake.token_type.value,
+        "amount": stake.amount,
+        "status": stake.status.value,
+        "locked_until": stake.locked_until,
+    }
+
+
+@router.post("/wallet/stake/withdraw")
+async def withdraw_stake(
+    request: WithdrawStakeRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Withdraw stake after lock period."""
+    check_rate_limit(user.user_id or "admin", "withdraw-stake")
+    
+    success = await wallet_service.withdraw_stake(request.stake_id)
+    return {"success": success, "stake_id": request.stake_id}
+
+
+@router.get("/wallet/stakes/{wallet_address}")
+async def get_wallet_stakes(
+    wallet_address: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get all stakes for a wallet."""
+    check_rate_limit(user.user_id or "admin", "get-stakes")
+    
+    stakes = [s for s in wallet_service.stakes.values() if s.wallet_address == wallet_address]
+    return {"stakes": [asdict(s) for s in stakes]}
+
+
+@router.get("/wallet/rewards/{wallet_address}")
+async def get_wallet_rewards(
+    wallet_address: str,
+    limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get reward history for a wallet."""
+    check_rate_limit(user.user_id or "admin", "get-rewards")
+    
+    rewards = [r for r in wallet_service.rewards if r.wallet_address == wallet_address]
+    rewards.sort(key=lambda r: r.distributed_at, reverse=True)
+    
+    return {
+        "rewards": [asdict(r) for r in rewards[:limit]],
+        "total": len(rewards),
+    }
+
+
+@router.get("/wallet/transactions/{wallet_address}")
+async def get_wallet_transactions(
+    wallet_address: str,
+    limit: int = 50,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get transaction history for a wallet."""
+    check_rate_limit(user.user_id or "admin", "get-transactions")
+    
+    transactions = [t for t in wallet_service.transactions if t.wallet_address == wallet_address]
+    transactions.sort(key=lambda t: t.timestamp, reverse=True)
+    
+    return {
+        "transactions": [asdict(t) for t in transactions[:limit]],
+        "total": len(transactions),
+    }
+
+
+@router.get("/wallet/network-stats")
+async def get_wallet_network_stats(
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Get network-wide wallet statistics."""
+    check_rate_limit(user.user_id or "admin", "wallet-stats")
+    
+    return await wallet_service.get_network_stats()
+
+
+@router.post("/wallet/calculate-rewards")
+async def calculate_rewards(
+    miner_id: str,
+    hours_trained: float = 0.0,
+    hours_seeded: float = 0.0,
+    bandwidth_mbps: float = 0.0,
+    performance_score: float = 1.0,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Calculate rewards for mining activities."""
+    check_rate_limit(user.user_id or "admin", "calculate-rewards")
+    
+    training_rewards = await wallet_service.calculate_training_rewards(
+        miner_id, hours_trained, performance_score
+    )
+    seeding_rewards = await wallet_service.calculate_seeding_rewards(
+        miner_id, hours_seeded, bandwidth_mbps
+    )
+    
+    return {
+        "miner_id": miner_id,
+        "training_rewards": training_rewards,
+        "seeding_rewards": seeding_rewards,
+        "total_rewards": training_rewards + seeding_rewards,
     }

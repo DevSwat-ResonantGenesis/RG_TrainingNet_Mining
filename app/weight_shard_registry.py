@@ -86,6 +86,9 @@ class ShardLocation:
     size_bytes: int = 0
     num_params: int = 0
     miner_address: str = ""             # IP:port for P2P download
+    webrtc_peer_id: str = ""          # WebRTC peer ID for DataChannel transfers
+    has_webrtc: bool = False          # WebRTC DataChannel available for transfers
+    webrtc_bandwidth: float = 0.0     # Measured WebRTC throughput (Mbps)
     download_progress: float = 0.0      # 0.0 → 1.0
     last_sync_at: str = ""
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -99,6 +102,24 @@ class ShardLocation:
     def is_available(self) -> bool:
         """Can this location serve weights to other miners?"""
         return self.state in (ShardState.LOADED, ShardState.CHECKPOINTED)
+    
+    @property
+    def can_serve_p2p(self) -> bool:
+        """Can this location serve weights via WebRTC DataChannel?"""
+        return self.is_available and self.has_webrtc and bool(self.webrtc_peer_id)
+    
+    @property
+    def transfer_priority(self) -> int:
+        """Priority for being selected as transfer source (higher = better)."""
+        if not self.is_available:
+            return 0
+        
+        # WebRTC peers get highest priority
+        if self.can_serve_p2p:
+            return 100 + int(self.webrtc_bandwidth)  # Bandwidth bonus
+        
+        # HTTP peers get lower priority
+        return 50
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -114,6 +135,9 @@ class ShardLocation:
             "size_bytes": self.size_bytes,
             "num_params": self.num_params,
             "miner_address": self.miner_address,
+            "webrtc_peer_id": self.webrtc_peer_id,
+            "has_webrtc": self.has_webrtc,
+            "webrtc_bandwidth": self.webrtc_bandwidth,
             "download_progress": self.download_progress,
             "last_sync_at": self.last_sync_at,
             "created_at": self.created_at,
@@ -319,14 +343,20 @@ class WeightShardRegistry:
                 continue
             sources.append(loc)
 
-        # Sort: PRIMARY > HOT_SPARE > COLD_BACKUP, then by version (newest first)
+        # Sort: WebRTC peers first, then by priority, then by version (newest first)
         priority_order = {
             ReplicaPriority.PRIMARY: 0,
             ReplicaPriority.HOT_SPARE: 1,
             ReplicaPriority.COLD_BACKUP: 2,
             ReplicaPriority.SEED: 3,
         }
-        sources.sort(key=lambda s: (priority_order.get(s.priority, 9), -s.version))
+        sources.sort(
+            key=lambda s: (
+                -s.transfer_priority,  # WebRTC peers get highest priority
+                priority_order.get(s.priority, 9),
+                -s.version,
+            )
+        )
         return sources
 
     def find_overlapping_sources(
@@ -537,6 +567,9 @@ class WeightShardRegistry:
                     "target_address": target.get("address", ""),
                     "source_miner_id": source.miner_id if source else None,
                     "source_address": source.miner_address if source else None,
+                    "source_webrtc_peer_id": source.webrtc_peer_id if source and source.can_serve_p2p else None,
+                    "source_has_webrtc": source.can_serve_p2p if source else False,
+                    "transfer_method": "webrtc" if source and source.can_serve_p2p else "http",
                     "priority": "urgent" if current_replicas == 0 else "normal",
                 }
                 plan.append(transfer)
@@ -697,6 +730,44 @@ class WeightShardRegistry:
             "total_weight_gb": round(total_bytes / 1e9, 2),
             "latest_version": latest.to_dict() if latest else None,
             "shard_map": {k: len(v) for k, v in shard_map.items()},  # Compact view
+        }
+
+    def update_miner_webrtc_info(
+        self,
+        miner_id: str,
+        webrtc_peer_id: str,
+        bandwidth_mbps: float = 0.0,
+    ):
+        """
+        Update WebRTC capabilities for all shards belonging to a miner.
+        
+        Called when a miner establishes WebRTC connections.
+        """
+        loc_ids = self.miner_shards.get(miner_id, set())
+        updated_count = 0
+        
+        for loc_id in loc_ids:
+            loc = self.locations.get(loc_id)
+            if loc:
+                loc.webrtc_peer_id = webrtc_peer_id
+                loc.has_webrtc = True
+                loc.webrtc_bandwidth = bandwidth_mbps
+                updated_count += 1
+        
+        if updated_count > 0:
+            logger.info(f"Updated WebRTC info for {updated_count} shards of miner {miner_id}")
+    
+    def get_registry_stats(self) -> Dict[str, Any]:
+        """Get registry statistics for monitoring."""
+        webrtc_enabled = sum(1 for loc in self.locations.values() if loc.can_serve_p2p)
+        return {
+            "total_locations": len(self.locations),
+            "total_replicas": len(self.shard_replicas),
+            "total_orphaned": self._total_orphaned,
+            "total_registered": self._total_registered,
+            "total_redistributed": self._total_redistributed,
+            "latest_version": self.latest_version,
+            "webrtc_enabled_locations": webrtc_enabled,
         }
 
 

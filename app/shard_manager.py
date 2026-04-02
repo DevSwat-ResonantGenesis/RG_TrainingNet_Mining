@@ -31,6 +31,14 @@ from uuid import uuid4
 
 logger = logging.getLogger("rg-mining.shard-manager")
 
+# Import P2P discovery for WebRTC NAT traversal
+try:
+    from .p2p_discovery import p2p_discovery
+    P2P_AVAILABLE = True
+except ImportError:
+    logger.warning("P2P discovery not available - WebRTC NAT traversal disabled")
+    P2P_AVAILABLE = False
+
 
 # ══════════════════════════════════════════════════════════════
 # DATA STRUCTURES
@@ -545,6 +553,24 @@ class ShardManager:
         # Organize into super-groups if we have many pipeline groups
         if len(created_groups) > self.MAX_PIPELINES_PER_SUPER_GROUP:
             self._organize_into_super_groups(created_groups)
+
+        # Initiate P2P WebRTC connections for each pipeline group
+        if P2P_AVAILABLE:
+            for group in created_groups:
+                assignments = []
+                for stage_idx, assignment in group.stages.items():
+                    assignments.append({
+                        "miner_id": assignment.miner_id,
+                        "stage_index": assignment.stage_index,
+                        "pipeline_group_id": assignment.pipeline_group_id,
+                        "layer_start": assignment.layer_start,
+                        "layer_end": assignment.layer_end,
+                    })
+                try:
+                    p2p_discovery.assign_pipeline_peers(group.group_id, assignments)
+                    logger.info(f"Initiated P2P connections for pipeline {group.group_id}")
+                except Exception as e:
+                    logger.error(f"Failed to initiate P2P for pipeline {group.group_id}: {e}")
 
         return created_groups
 
