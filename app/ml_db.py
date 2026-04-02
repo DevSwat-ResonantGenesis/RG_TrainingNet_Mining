@@ -161,6 +161,59 @@ class GradientRecord(MLBase):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class WeightShardLocationDB(MLBase):
+    """
+    Persistent storage for WeightShardRegistry locations.
+    
+    Mirrors the ShardLocation dataclass so the registry survives restarts.
+    Write-through: every register/update/orphan writes here AND in-memory.
+    On startup, the registry loads all rows back into memory.
+    """
+    __tablename__ = "weight_shard_locations"
+
+    location_id = Column(String(64), primary_key=True)
+    model_id = Column(String(128), nullable=False, index=True)
+    miner_id = Column(String(128), nullable=False, index=True)
+    layer_start = Column(Integer, nullable=False)
+    layer_end = Column(Integer, nullable=False)
+    version = Column(Integer, nullable=False, default=0)
+    weight_hash = Column(String(64), nullable=False, default="")
+    state = Column(String(32), nullable=False, default="allocated")
+    priority = Column(String(32), nullable=False, default="primary")
+    size_bytes = Column(BigInteger, nullable=False, default=0)
+    num_params = Column(BigInteger, nullable=False, default=0)
+    miner_address = Column(String(256), nullable=False, default="")
+    download_progress = Column(Float, nullable=False, default=0.0)
+    last_sync_at = Column(String(64), nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_wsl_model_layers", "model_id", "layer_start", "layer_end"),
+        Index("ix_wsl_miner", "miner_id"),
+        Index("ix_wsl_state", "state"),
+    )
+
+
+class WeightVersionDB(MLBase):
+    """Persistent storage for weight version snapshots (Merkle roots)."""
+    __tablename__ = "weight_versions"
+
+    version_id = Column(String(64), primary_key=True)
+    model_id = Column(String(128), nullable=False, index=True)
+    global_step = Column(BigInteger, nullable=False, index=True)
+    merkle_root = Column(String(64), nullable=False)
+    chain_tx_hash = Column(String(128), nullable=False, default="")
+    num_shards = Column(Integer, nullable=False, default=0)
+    total_params = Column(BigInteger, nullable=False, default=0)
+    shard_hashes_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_wv_model_step", "model_id", "global_step"),
+    )
+
+
 # ── Session helper ──
 
 async def get_ml_session() -> AsyncSession:

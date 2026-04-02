@@ -291,6 +291,27 @@ class ShardManager:
         miner.last_heartbeat = datetime.now(timezone.utc).isoformat()
         return True
 
+    def update_miner_bandwidth(self, miner_id: str, bandwidth_mbps: float) -> bool:
+        """
+        Update a miner's measured bandwidth (Mbps).
+        
+        Called when a miner completes a P2P probe to its pipeline neighbors.
+        This feeds into the bandwidth-aware redistribution scorer.
+        """
+        miner = self.miners.get(miner_id)
+        if not miner:
+            return False
+        old_bw = miner.bandwidth_mbps
+        # Exponential moving average if miner already has a measurement
+        if old_bw > 0:
+            miner.bandwidth_mbps = 0.7 * bandwidth_mbps + 0.3 * old_bw
+        else:
+            miner.bandwidth_mbps = bandwidth_mbps
+        logger.info(
+            f"Miner {miner_id} bandwidth updated: {old_bw:.0f} → {miner.bandwidth_mbps:.0f} Mbps"
+        )
+        return True
+
     def get_available_miners(self, min_vram_gb: float = 0) -> List[MinerCapability]:
         """Get all available miners, optionally filtered by VRAM."""
         return [
@@ -855,11 +876,15 @@ class ShardManager:
         """
         Find the best available miner to fill an empty pipeline stage.
         
-        Scoring:
-          - Must have enough VRAM for the shard
-          - Prefer same region as neighbors (lower P2P latency)
-          - Prefer higher VRAM (more headroom)
-          - Prefer lower current load
+        Bandwidth-aware scoring (sorted by priority):
+          1. Region match — same region as upstream/downstream neighbors (lowest P2P latency)
+          2. Bandwidth — higher measured bandwidth to pipeline neighbors
+          3. VRAM — more headroom for activations and optimizer states
+          4. Load balance — prefer miners with fewer existing shard assignments
+        
+        The bandwidth factor is critical for pipeline parallelism: the 1F1B engine
+        sends activations forward and gradients backward every microbatch. A miner
+        with 10 Gbps link saturates the pipeline 10x faster than one at 1 Gbps.
         """
         num_layers = model_config["num_layers"]
         layer_ranges = self.compute_layer_assignment(num_layers, group.num_stages)
@@ -884,19 +909,45 @@ class ShardManager:
         if not available:
             return None
 
-        # Find neighbor regions for locality preference
+        # Find neighbor regions and bandwidth for locality preference
         neighbor_regions = set()
+        neighbor_bandwidths: List[float] = []
         for adj_stage in (stage_index - 1, stage_index + 1):
             adj = group.stages.get(adj_stage)
             if adj:
                 adj_miner = self.miners.get(adj.miner_id)
                 if adj_miner:
                     neighbor_regions.add(adj_miner.location_region)
+                    neighbor_bandwidths.append(adj_miner.bandwidth_mbps)
+
+        # Target bandwidth: min of neighbors (bottleneck is weakest link)
+        neighbor_bw_floor = min(neighbor_bandwidths) if neighbor_bandwidths else 0.0
 
         def score_miner(m: MinerCapability) -> Tuple:
-            """Higher score = better candidate. Returns tuple for sorting."""
+            """
+            Higher score = better candidate.
+            
+            Tuple ordering (most significant first):
+              1. region_match: bool → prefer same region as neighbors
+              2. bandwidth_score: float → normalized bandwidth (0.0–1.0)
+                 Effective pipeline throughput = min(candidate_bw, neighbor_bw)
+                 so a 10 Gbps miner paired with a 1 Gbps neighbor → 1 Gbps effective.
+              3. vram: float → raw VRAM in GB
+              4. -load: int → fewer assignments = better (negative for reverse sort)
+            """
             region_match = 1 if m.location_region in neighbor_regions else 0
-            return (region_match, m.gpu_vram_gb, -self.miner_shards_count(m.miner_id))
+
+            # Bandwidth scoring: effective throughput to pipeline neighbors
+            if m.bandwidth_mbps > 0 and neighbor_bw_floor > 0:
+                effective_bw = min(m.bandwidth_mbps, neighbor_bw_floor)
+                # Normalize: 100 Mbps = 0.1, 1 Gbps = 1.0, 10 Gbps = 10.0
+                bandwidth_score = effective_bw / 1000.0
+            elif m.bandwidth_mbps > 0:
+                bandwidth_score = m.bandwidth_mbps / 1000.0
+            else:
+                bandwidth_score = 0.0
+
+            return (region_match, bandwidth_score, m.gpu_vram_gb, -self.miner_shards_count(m.miner_id))
 
         available.sort(key=score_miner, reverse=True)
         return available[0]

@@ -58,6 +58,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"ML database init skipped (non-fatal): {e}")
 
+    # Load persistent weight shard registry from database
+    try:
+        from .weight_shard_registry import weight_registry
+        await weight_registry.init_persistence()
+        logger.info("Weight shard registry persistence initialized")
+    except Exception as e:
+        logger.warning(f"Weight registry persistence skipped (non-fatal): {e}")
+
     # Register with Lighthouse (non-blocking, best-effort)
     try:
         await chain_bridge.register_with_lighthouse(service_type="mining")

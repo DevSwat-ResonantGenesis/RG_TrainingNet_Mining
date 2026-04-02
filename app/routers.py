@@ -633,6 +633,42 @@ async def find_weight_sources(
     }
 
 
+# ============== Bandwidth Reporting ==============
+
+class BandwidthReport(BaseModel):
+    miner_id: str
+    bandwidth_mbps: float
+    peer_miner_id: str = ""
+    measurement_method: str = "probe"  # probe, transfer, estimate
+
+
+@router.post("/miners/report-bandwidth")
+async def report_bandwidth(
+    request: BandwidthReport,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Miner reports measured P2P bandwidth to its pipeline neighbors.
+    
+    This feeds into the bandwidth-aware redistribution scorer so that
+    liquid redistribution prioritizes miners with the fastest connections.
+    Called after a miner completes a P2P probe or weight transfer.
+    """
+    check_rate_limit(user.user_id or request.miner_id, "heartbeat")
+    updated = shard_manager.update_miner_bandwidth(
+        request.miner_id, request.bandwidth_mbps
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Miner not registered")
+    miner = shard_manager.miners.get(request.miner_id)
+    return {
+        "status": "updated",
+        "miner_id": request.miner_id,
+        "bandwidth_mbps": miner.bandwidth_mbps if miner else 0,
+        "measurement_method": request.measurement_method,
+    }
+
+
 # ============== Admin / Testing ==============
 
 @router.post("/admin/simulate-disconnect/{miner_id}")

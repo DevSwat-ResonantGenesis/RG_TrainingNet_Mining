@@ -502,9 +502,14 @@ class WeightShardRegistry:
                 if m["miner_id"] not in existing_miners
             ]
 
-            # Sort candidates: least loaded first, then by VRAM (most first)
+            # Sort candidates: highest bandwidth first (fastest P2P transfer),
+            # then least loaded, then most VRAM
             candidates.sort(
-                key=lambda m: (miner_load.get(m["miner_id"], 0), -m.get("gpu_vram_gb", 0))
+                key=lambda m: (
+                    -m.get("bandwidth_mbps", 0),
+                    miner_load.get(m["miner_id"], 0),
+                    -m.get("gpu_vram_gb", 0),
+                )
             )
 
             # Parse layer range from key
@@ -695,5 +700,215 @@ class WeightShardRegistry:
         }
 
 
-# Global instance
-weight_registry = WeightShardRegistry()
+class PersistentWeightShardRegistry(WeightShardRegistry):
+    """
+    Write-through persistent extension of WeightShardRegistry.
+    
+    Architecture:
+      - In-memory dicts for fast reads (inherited from parent)
+      - Every mutation (register, update, orphan) writes through to PostgreSQL
+      - On startup, load_from_db() rebuilds in-memory state from DB
+      - If no database is configured, falls back to pure in-memory (parent behavior)
+    
+    This ensures the global "shard map" survives Mining service restarts.
+    """
+
+    def __init__(self, policy: ReplicationPolicy = None):
+        super().__init__(policy)
+        self._db_available = False
+
+    async def init_persistence(self):
+        """Check if database is available and load existing state."""
+        try:
+            from .ml_db import ml_engine, MLSessionLocal
+            if ml_engine is None or MLSessionLocal is None:
+                logger.info("PersistentWeightShardRegistry: no DB configured, running in-memory only")
+                return
+            self._db_available = True
+            await self.load_from_db()
+        except Exception as e:
+            logger.warning(f"PersistentWeightShardRegistry: DB init failed, running in-memory: {e}")
+
+    async def load_from_db(self):
+        """Rebuild in-memory indexes from database rows."""
+        if not self._db_available:
+            return
+
+        try:
+            from .ml_db import MLSessionLocal, WeightShardLocationDB, WeightVersionDB
+            from sqlalchemy import select
+
+            async with MLSessionLocal() as session:
+                # Load all shard locations
+                result = await session.execute(select(WeightShardLocationDB))
+                rows = result.scalars().all()
+
+                loaded_count = 0
+                for row in rows:
+                    loc = ShardLocation(
+                        location_id=row.location_id,
+                        model_id=row.model_id,
+                        miner_id=row.miner_id,
+                        layer_start=row.layer_start,
+                        layer_end=row.layer_end,
+                        version=row.version,
+                        weight_hash=row.weight_hash,
+                        state=ShardState(row.state),
+                        priority=ReplicaPriority(row.priority),
+                        size_bytes=row.size_bytes,
+                        num_params=row.num_params,
+                        miner_address=row.miner_address,
+                        download_progress=row.download_progress,
+                        last_sync_at=row.last_sync_at or "",
+                        created_at=row.created_at.isoformat() if row.created_at else "",
+                    )
+                    # Insert into in-memory indexes (bypass DB write-through)
+                    self.locations[loc.location_id] = loc
+                    key = loc.shard_key
+                    if key not in self.shard_replicas:
+                        self.shard_replicas[key] = set()
+                    self.shard_replicas[key].add(loc.location_id)
+                    if loc.miner_id not in self.miner_shards:
+                        self.miner_shards[loc.miner_id] = set()
+                    self.miner_shards[loc.miner_id].add(loc.location_id)
+                    loaded_count += 1
+
+                # Load weight versions
+                result = await session.execute(
+                    select(WeightVersionDB).order_by(WeightVersionDB.global_step)
+                )
+                version_rows = result.scalars().all()
+                for vrow in version_rows:
+                    wv = WeightVersion(
+                        version_id=vrow.version_id,
+                        model_id=vrow.model_id,
+                        global_step=vrow.global_step,
+                        shard_hashes=vrow.shard_hashes_json or {},
+                        merkle_root=vrow.merkle_root,
+                        chain_tx_hash=vrow.chain_tx_hash,
+                        num_shards=vrow.num_shards,
+                        total_params=vrow.total_params,
+                        created_at=vrow.created_at.isoformat() if vrow.created_at else "",
+                    )
+                    self.versions[vrow.global_step] = wv
+                    self.latest_version = max(self.latest_version, vrow.global_step)
+
+            logger.info(
+                f"PersistentWeightShardRegistry: loaded {loaded_count} shard locations, "
+                f"{len(self.versions)} versions from database"
+            )
+        except Exception as e:
+            logger.error(f"PersistentWeightShardRegistry: failed to load from DB: {e}")
+
+    async def _persist_location(self, loc: ShardLocation):
+        """Write a single ShardLocation to the database."""
+        if not self._db_available:
+            return
+        try:
+            from .ml_db import MLSessionLocal, WeightShardLocationDB
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            async with MLSessionLocal() as session:
+                async with session.begin():
+                    stmt = pg_insert(WeightShardLocationDB).values(
+                        location_id=loc.location_id,
+                        model_id=loc.model_id,
+                        miner_id=loc.miner_id,
+                        layer_start=loc.layer_start,
+                        layer_end=loc.layer_end,
+                        version=loc.version,
+                        weight_hash=loc.weight_hash,
+                        state=loc.state.value,
+                        priority=loc.priority.value,
+                        size_bytes=loc.size_bytes,
+                        num_params=loc.num_params,
+                        miner_address=loc.miner_address,
+                        download_progress=loc.download_progress,
+                        last_sync_at=loc.last_sync_at,
+                    ).on_conflict_do_update(
+                        index_elements=["location_id"],
+                        set_={
+                            "state": loc.state.value,
+                            "version": loc.version,
+                            "weight_hash": loc.weight_hash,
+                            "download_progress": loc.download_progress,
+                            "last_sync_at": loc.last_sync_at,
+                            "miner_address": loc.miner_address,
+                        },
+                    )
+                    await session.execute(stmt)
+        except Exception as e:
+            logger.error(f"Failed to persist shard location {loc.location_id}: {e}")
+
+    async def _persist_version(self, version: WeightVersion):
+        """Write a WeightVersion snapshot to the database."""
+        if not self._db_available:
+            return
+        try:
+            from .ml_db import MLSessionLocal, WeightVersionDB
+            from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+            async with MLSessionLocal() as session:
+                async with session.begin():
+                    stmt = pg_insert(WeightVersionDB).values(
+                        version_id=version.version_id,
+                        model_id=version.model_id,
+                        global_step=version.global_step,
+                        merkle_root=version.merkle_root,
+                        chain_tx_hash=version.chain_tx_hash,
+                        num_shards=version.num_shards,
+                        total_params=version.total_params,
+                        shard_hashes_json=version.shard_hashes,
+                    ).on_conflict_do_update(
+                        index_elements=["version_id"],
+                        set_={
+                            "merkle_root": version.merkle_root,
+                            "chain_tx_hash": version.chain_tx_hash,
+                        },
+                    )
+                    await session.execute(stmt)
+        except Exception as e:
+            logger.error(f"Failed to persist weight version {version.version_id}: {e}")
+
+    # ── Override mutations to add write-through ──
+
+    def register_shard(self, location: ShardLocation) -> ShardLocation:
+        """Register shard in-memory + schedule DB persist."""
+        result = super().register_shard(location)
+        asyncio.ensure_future(self._persist_location(result))
+        return result
+
+    def update_shard_state(
+        self,
+        location_id: str,
+        state: ShardState,
+        weight_hash: str = "",
+        version: int = 0,
+        progress: float = 0.0,
+    ) -> Optional[ShardLocation]:
+        """Update shard state in-memory + schedule DB persist."""
+        result = super().update_shard_state(location_id, state, weight_hash, version, progress)
+        if result:
+            asyncio.ensure_future(self._persist_location(result))
+        return result
+
+    def orphan_miner_shards(self, miner_id: str) -> List[ShardLocation]:
+        """Orphan shards in-memory + schedule DB persist for each."""
+        orphaned = super().orphan_miner_shards(miner_id)
+        for loc in orphaned:
+            asyncio.ensure_future(self._persist_location(loc))
+        return orphaned
+
+    def create_version_snapshot(
+        self,
+        model_id: str,
+        global_step: int,
+    ) -> WeightVersion:
+        """Create version snapshot in-memory + schedule DB persist."""
+        version = super().create_version_snapshot(model_id, global_step)
+        asyncio.ensure_future(self._persist_version(version))
+        return version
+
+
+# Global instance — uses persistent variant so it survives restarts
+weight_registry = PersistentWeightShardRegistry()
