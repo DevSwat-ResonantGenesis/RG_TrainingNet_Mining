@@ -633,6 +633,37 @@ async def find_weight_sources(
     }
 
 
+# ============== Admin / Testing ==============
+
+@router.post("/admin/simulate-disconnect/{miner_id}")
+async def simulate_miner_disconnect(
+    miner_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Simulate a miner disconnect for fire-drill testing.
+    
+    Triggers the full disconnect flow:
+    1. Orphan the miner's weight shards in the registry
+    2. Handle disconnect in the shard manager (mark pipeline DEGRADED)
+    3. Return the state changes for observation
+    """
+    check_rate_limit(user.user_id or "anon", "default")
+
+    # Step 1: Orphan weight shards
+    orphaned = weight_registry.orphan_miner_shards(miner_id)
+
+    # Step 2: Shard manager disconnect (marks pipeline DEGRADED)
+    affected_group = shard_manager.handle_miner_disconnect(miner_id)
+
+    return {
+        "miner_id": miner_id,
+        "orphaned_shards": orphaned,
+        "affected_pipeline_group": affected_group,
+        "registry_stats": weight_registry.get_stats(),
+    }
+
+
 # ============== Liquid Redistribution ==============
 
 @router.post("/shards/auto-heal")
