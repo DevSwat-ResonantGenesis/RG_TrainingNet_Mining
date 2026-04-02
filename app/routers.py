@@ -292,6 +292,136 @@ async def get_training_data_sources():
     return TRAINING_DATA_SOURCES
 
 
+# ============== Shard Manager ==============
+
+from .shard_manager import shard_manager, MinerCapability
+from .sharded_param_server import create_parameter_server
+
+
+class MinerCapabilityRequest(BaseModel):
+    miner_id: str
+    gpu_model: str = ""
+    gpu_vram_gb: float = 0.0
+    system_ram_gb: float = 0.0
+    cpu_cores: int = 0
+    bandwidth_mbps: float = 0.0
+    storage_available_gb: float = 0.0
+    location_region: str = "unknown"
+    supported_dtypes: List[str] = ["fp32", "fp16"]
+
+
+@router.post("/shards/register-capability")
+async def register_miner_capability(req: MinerCapabilityRequest):
+    """Register a miner's hardware capabilities for shard assignment."""
+    cap = MinerCapability(
+        miner_id=req.miner_id,
+        gpu_model=req.gpu_model,
+        gpu_vram_gb=req.gpu_vram_gb,
+        system_ram_gb=req.system_ram_gb,
+        cpu_cores=req.cpu_cores,
+        bandwidth_mbps=req.bandwidth_mbps,
+        storage_available_gb=req.storage_available_gb,
+        location_region=req.location_region,
+        supported_dtypes=req.supported_dtypes,
+    )
+    result = shard_manager.register_miner(cap)
+    return {"status": "registered", "miner": result.to_dict()}
+
+
+@router.get("/shards/assignments")
+async def get_shard_assignments():
+    """List all current shard assignments."""
+    return {
+        "assignments": {
+            mid: a.to_dict() for mid, a in shard_manager.miner_assignments.items()
+        },
+        "total": len(shard_manager.miner_assignments),
+    }
+
+
+@router.get("/shards/assignment/{miner_id}")
+async def get_miner_assignment(miner_id: str):
+    """Get a specific miner's shard assignment."""
+    assignment = shard_manager.get_assignment(miner_id)
+    if not assignment:
+        raise HTTPException(status_code=404, detail=f"No assignment for miner {miner_id}")
+    return assignment.to_dict()
+
+
+@router.get("/shards/pipeline-groups")
+async def get_pipeline_groups():
+    """List all pipeline groups."""
+    return {
+        "groups": {
+            gid: g.to_dict() for gid, g in shard_manager.pipeline_groups.items()
+        },
+        "total": len(shard_manager.pipeline_groups),
+    }
+
+
+@router.post("/shards/form-groups")
+async def form_pipeline_groups(
+    model_id: str = "resonant-seed-1b",
+    target_redundancy: int = 2,
+):
+    """Trigger pipeline group formation from available miners."""
+    config = get_model_config(model_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+    groups = shard_manager.form_pipeline_groups(model_id, config, target_redundancy)
+    return {
+        "formed": len(groups),
+        "groups": [g.to_dict() for g in groups],
+    }
+
+
+@router.post("/shards/report-ready/{miner_id}")
+async def report_shard_ready(miner_id: str):
+    """Miner reports its shard is loaded and ready."""
+    ok = shard_manager.report_shard_ready(miner_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"No assignment for miner {miner_id}")
+    return {"status": "ready", "miner_id": miner_id}
+
+
+@router.get("/shards/stats")
+async def shard_manager_stats():
+    """Shard manager statistics."""
+    return shard_manager.get_stats()
+
+
+@router.get("/shards/needs-sharding/{model_id}")
+async def check_needs_sharding(model_id: str):
+    """Check if a model needs sharding based on available miners."""
+    config = get_model_config(model_id)
+    if not config:
+        raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
+    needs = shard_manager.needs_sharding(config)
+    available = shard_manager.get_available_miners()
+    optimal_stages = shard_manager.compute_optimal_stages(config, available) if available else 1
+    return {
+        "model_id": model_id,
+        "needs_sharding": needs,
+        "num_available_miners": len(available),
+        "optimal_stages": optimal_stages,
+        "model_params": config.get("num_parameters", 0),
+        "model_layers": config.get("num_layers", 0),
+    }
+
+
+@router.get("/shards/pipeline-peers/{miner_id}")
+async def get_pipeline_peers(miner_id: str):
+    """Get peers in the same pipeline group (for P2P activation routing)."""
+    peers = shard_manager.get_pipeline_peers(miner_id)
+    assignment = shard_manager.get_assignment(miner_id)
+    return {
+        "miner_id": miner_id,
+        "peers": peers,
+        "upstream": assignment.upstream_miner_id if assignment else None,
+        "downstream": assignment.downstream_miner_id if assignment else None,
+    }
+
+
 # ============== Health ==============
 
 @router.get("/health")
@@ -303,4 +433,9 @@ async def health():
         "genesis_initialized": genesis_initializer.state.initialized,
         "registered_miners": len(param_server.miners),
         "global_step": param_server.global_step,
+        "shard_manager": {
+            "total_miners": len(shard_manager.miners),
+            "pipeline_groups": len(shard_manager.pipeline_groups),
+            "assigned_miners": len(shard_manager.miner_assignments),
+        },
     }
