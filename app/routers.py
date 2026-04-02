@@ -8,11 +8,12 @@ gradient submission, miner registration, parameter server stats.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 import json
 import logging
-from uuid import uuid4, uuid
+from uuid import uuid4
 from datetime import datetime, timezone
 from dataclasses import asdict
 
