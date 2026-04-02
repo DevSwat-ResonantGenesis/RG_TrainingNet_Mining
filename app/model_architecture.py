@@ -102,7 +102,7 @@ def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> T
     """Apply rotary embeddings to query and key tensors."""
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:xq_.shape[1], :].unsqueeze(0).unsqueeze(2)
+    freqs_cis = freqs_cis[:xq_.shape[2], :].unsqueeze(0).unsqueeze(1)
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(-2)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(-2)
     return xq_out.type_as(xq), xk_out.type_as(xk)
