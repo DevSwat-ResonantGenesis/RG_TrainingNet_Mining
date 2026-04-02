@@ -58,9 +58,16 @@ JWT_SECRET_KEY = os.getenv("AUTH_JWT_SECRET_KEY", "")
 JWT_ALGORITHM = "HS256"
 INTERNAL_SERVICE_KEY = os.getenv("AUTH_INTERNAL_SERVICE_KEY", "")
 ACCESS_COOKIE_NAME = "rg_access_token"
+IS_PRODUCTION = os.getenv("RG_ENV", "development") == "production"
 
-# Dev mode: skip auth when no secret is configured (local testing only)
+# SECURITY: Dev bypass ONLY in non-production environments.
+# In production, if AUTH_JWT_SECRET_KEY is missing, all requests are DENIED.
 AUTH_ENABLED = bool(JWT_SECRET_KEY)
+if IS_PRODUCTION and not AUTH_ENABLED:
+    logger.critical(
+        "SECURITY: AUTH_JWT_SECRET_KEY is NOT set in production! "
+        "All requests will be DENIED until a valid secret is configured."
+    )
 
 security_scheme = HTTPBearer(auto_error=False)
 
@@ -173,8 +180,14 @@ async def get_current_user(request: Request) -> AuthenticatedUser:
             auth_method="internal",
         )
 
-    # Dev mode: skip auth if no secret configured
+    # SECURITY: In production, DENY if no JWT secret is configured.
+    # Dev bypass is ONLY allowed in non-production environments.
     if not AUTH_ENABLED:
+        if IS_PRODUCTION:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication not configured — service is locked",
+            )
         return AuthenticatedUser(
             user_id="dev-user",
             org_id="dev-org",

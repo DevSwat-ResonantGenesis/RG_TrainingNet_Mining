@@ -28,10 +28,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 logger = logging.getLogger(__name__)
 
 # ── Connection ──
-ML_DATABASE_URL = os.getenv(
-    "ML_DATABASE_URL",
-    "postgresql+asyncpg://doadmin:AVNS_Ts6MtEs9WQIYwkw1FoI@ml-registry-db-do-user-18031534-0.g.db.ondigitalocean.com:25060/defaultdb?ssl=require"
-)
+# SECURITY: Never hardcode database credentials. Set ML_DATABASE_URL as env var.
+ML_DATABASE_URL = os.getenv("ML_DATABASE_URL", "")
 
 # S3 config for weight blob storage
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "https://sfo3.digitaloceanspaces.com")
@@ -40,15 +38,22 @@ S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
 S3_BUCKET = os.getenv("S3_BUCKET", "genesis2026")
 S3_WEIGHTS_PREFIX = "model-weights/"
 
-ml_engine = create_async_engine(
-    ML_DATABASE_URL,
-    echo=False,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-)
+if ML_DATABASE_URL:
+    ml_engine = create_async_engine(
+        ML_DATABASE_URL,
+        echo=False,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+    )
+else:
+    ml_engine = None
+    logger.info("ML_DATABASE_URL not set — database features disabled")
 
-MLSessionLocal = sessionmaker(ml_engine, class_=AsyncSession, expire_on_commit=False)
+if ml_engine:
+    MLSessionLocal = sessionmaker(ml_engine, class_=AsyncSession, expire_on_commit=False)
+else:
+    MLSessionLocal = None
 MLBase = declarative_base()
 
 
@@ -160,11 +165,16 @@ class GradientRecord(MLBase):
 
 async def get_ml_session() -> AsyncSession:
     """Get an async session to the ML database."""
+    if MLSessionLocal is None:
+        raise RuntimeError("ML_DATABASE_URL not configured — cannot create database session")
     return MLSessionLocal()
 
 
 async def init_ml_tables():
     """Create all ML tables if they don't exist."""
+    if ml_engine is None:
+        logger.info("ML_DATABASE_URL not set — skipping table creation")
+        return
     try:
         async with ml_engine.begin() as conn:
             await conn.run_sync(MLBase.metadata.create_all)
