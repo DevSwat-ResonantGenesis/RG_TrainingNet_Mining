@@ -40,6 +40,8 @@ from .training_task import task_manager, GradientSubmission
 from .gradient_compressor import CompressedGradient, verify_gradient_hash
 from .auth_middleware import get_ws_user, check_rate_limit, AuthenticatedUser
 from .chain_bridge import chain_bridge
+from .shard_manager import shard_manager
+from .sharded_param_server import sharded_param_server
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +140,27 @@ async def handle_mining_ws(ws: WebSocket):
 
         logger.info(f"WS: Miner {miner_id} registered (class={miner_class}, user={auth_user.user_id}, email={account_email})")
 
+        # Check shard assignment for this miner
+        shard_assignment = shard_manager.miner_assignments.get(miner_id)
+        shard_info = None
+        if shard_assignment:
+            shard_info = {
+                "pipeline_group_id": shard_assignment.pipeline_group_id,
+                "stage_index": shard_assignment.stage_index,
+                "num_stages": shard_assignment.num_stages,
+                "layer_start": shard_assignment.layer_start,
+                "layer_end": shard_assignment.layer_end,
+                "has_embedding": shard_assignment.has_embedding,
+                "has_lm_head": shard_assignment.has_lm_head,
+                "upstream_miner_id": shard_assignment.upstream_miner_id,
+                "downstream_miner_id": shard_assignment.downstream_miner_id,
+            }
+            logger.info(
+                f"WS: Miner {miner_id} is pipeline stage "
+                f"{shard_assignment.stage_index}/{shard_assignment.num_stages} "
+                f"in group {shard_assignment.pipeline_group_id[:12]}..."
+            )
+
         # Send welcome
         await ws.send_json({
             "event": "welcome",
@@ -148,6 +171,7 @@ async def handle_mining_ws(ws: WebSocket):
             "genesis_status": genesis_initializer.get_status() if genesis_initializer.state.initialized else None,
             "param_server": param_server.get_stats(),
             "connected_miners": ws_manager.connected_count,
+            "shard_assignment": shard_info,
         })
 
         # Main message loop
@@ -156,11 +180,20 @@ async def handle_mining_ws(ws: WebSocket):
             action = data.get("action", "")
 
             if action == "heartbeat":
-                await ws.send_json({
+                hb_response = {
                     "event": "heartbeat_ack",
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "global_step": param_server.global_step,
-                })
+                }
+                # Include shard health if this miner is in a pipeline
+                if shard_assignment:
+                    group = shard_manager.get_pipeline_group(shard_assignment.pipeline_group_id)
+                    hb_response["shard_health"] = {
+                        "pipeline_status": group.status.value if group else "unknown",
+                        "stage_index": shard_assignment.stage_index,
+                        "is_ready": shard_assignment.miner_id in shard_manager._ready_miners if hasattr(shard_manager, '_ready_miners') else False,
+                    }
+                await ws.send_json(hb_response)
 
             elif action == "request_task":
                 task = task_manager.assign_task(miner_id)
@@ -216,6 +249,24 @@ async def handle_mining_ws(ws: WebSocket):
     finally:
         if miner_id:
             await ws_manager.disconnect(miner_id)
+            # Notify ShardManager — may mark pipeline group as DEGRADED
+            affected_group = shard_manager.handle_miner_disconnect(miner_id)
+            if affected_group:
+                logger.warning(
+                    f"WS: Miner {miner_id} disconnect degraded pipeline group {affected_group}"
+                )
+                # Notify remaining miners in the group
+                group = shard_manager.get_pipeline_group(affected_group)
+                if group:
+                    for stage in group.stages.values():
+                        if stage.miner_id != miner_id:
+                            await ws_manager.send_to_miner(stage.miner_id, {
+                                "event": "pipeline_degraded",
+                                "pipeline_group_id": affected_group,
+                                "disconnected_miner": miner_id,
+                                "disconnected_stage": stage.stage_index,
+                                "group_status": group.status.value,
+                            })
 
 
 async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):

@@ -657,3 +657,7 @@ def create_parameter_server(
     )
 
     return aggregator
+
+
+# Global instance — lazily initialized when first pipeline group forms
+sharded_param_server = GlobalAggregator(model_id="default")

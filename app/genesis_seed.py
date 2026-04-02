@@ -133,6 +133,13 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "min_weight_shards": 405,
         "min_gpu_vram_gb": 40,
         "phase": "Phase 6 — Frontier class (MoE)",
+        # MoE-specific fields
+        "num_experts": 128,              # 128 expert FFN networks
+        "num_experts_per_token": 2,      # Top-2 gating per token
+        "expert_capacity_factor": 1.25,  # 25% overcapacity for load balance
+        "moe_layer_frequency": 2,        # Every other layer is MoE (63 MoE + 63 dense)
+        "shared_expert_ratio": 0.25,     # 25% of expert capacity as shared/always-on
+        "router_aux_loss_coef": 0.01,    # Load balancing loss weight
     },
 }
 
