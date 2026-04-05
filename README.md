@@ -58,3 +58,25 @@ docker run -p 8000:8000 rg-mining
 | 2 | 50 |
 | 3 | 25 |
 | 4 | 12.5 |
+
+## Reward Security (Proof-of-Training)
+
+The `/crypto/miner/credit` endpoint uses 5-layer verification to prevent unauthorized token minting:
+
+| Layer | Check |
+|-------|-------|
+| Internal Key Auth | `X-Internal-Key` header must match `AUTH_INTERNAL_SERVICE_KEY` |
+| Gradient Hash Required | `gradient_hash` mandatory — must actually process a gradient |
+| HMAC-SHA256 Signature | Mining service signs `{gradient_hash}:{user_id}:{amount}:{timestamp}` — crypto service verifies |
+| Replay Protection | Each `gradient_hash` recorded in `mining_credits` table (UNIQUE constraint) — credited exactly once |
+| Reward Cap | Max **500 $RGT per credit call** — prevents inflation from any single request |
+
+**Per-call vs per-session:** The 500 $RGT cap applies to each individual API call, not to the total session. Each mining cycle triggers one credit call (~100-150 $RGT). A 5-cycle session = 5 separate calls × ~150 = ~750 $RGT total — legitimate and within bounds. The cap blocks single-call abuse (e.g., a compromised service trying to mint 10,000 $RGT at once).
+
+### Chain Bridge (`app/chain_bridge.py`)
+
+The `ChainBridge.credit_miner_wallet()` method:
+1. Requires a valid `gradient_hash` (no hash = skip)
+2. Generates HMAC-SHA256 signature with current timestamp
+3. POSTs to `CRYPTO_SERVICE_URL/crypto/miner/credit` with `X-Internal-Key` header
+4. Fire-and-forget via `asyncio.create_task()` — never blocks training
