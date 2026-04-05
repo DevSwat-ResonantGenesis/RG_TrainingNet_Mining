@@ -12,8 +12,11 @@ a chain write failure.
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
+import time
 from typing import Dict, Any, Optional
 
 import httpx
@@ -154,6 +157,21 @@ class ChainBridge:
 
     # ── Crypto wallet credit ──
 
+    @staticmethod
+    def _sign_credit(gradient_hash: str, user_id: str, rgt_amount: float, timestamp: int) -> str:
+        """
+        HMAC-SHA256 proof-of-training signature.
+        Only the mining service (which holds INTERNAL_SERVICE_KEY) can produce this.
+        The crypto service verifies it before crediting — like Bitcoin's coinbase tx
+        being tied to the block's proof-of-work.
+        """
+        msg = f"{gradient_hash}:{user_id}:{rgt_amount}:{timestamp}"
+        return hmac.new(
+            INTERNAL_SERVICE_KEY.encode(),
+            msg.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
     async def credit_miner_wallet(
         self,
         user_id: Optional[str],
@@ -169,11 +187,21 @@ class ChainBridge:
         """
         Credit mined $RGT to the user's wallet via Crypto service.
         Fire-and-forget — never blocks training.
+
+        Security: HMAC-signed proof-of-training prevents anyone from
+        calling the credit endpoint without having actually processed
+        a gradient through the mining service.
         """
         if not self._enabled:
             return
         if not user_id and not email:
             return
+        if not gradient_hash:
+            logger.warning("Wallet credit skipped: no gradient_hash (no proof-of-training)")
+            return
+
+        timestamp = int(time.time())
+        signature = self._sign_credit(gradient_hash, user_id or "", rgt_amount, timestamp)
 
         payload = {
             "user_id": user_id,
@@ -186,6 +214,8 @@ class ChainBridge:
             "gradient_hash": gradient_hash,
             "task_id": task_id,
             "global_step": global_step,
+            "timestamp": timestamp,
+            "signature": signature,
         }
 
         try:
