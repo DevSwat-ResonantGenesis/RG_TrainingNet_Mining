@@ -1,13 +1,15 @@
-# RG Mining Service
+# RG_TrainingNet_Mining
 
-Decentralized LLM training orchestration for the ResonantGenesis network.
+Decentralized LLM training orchestration — gradient aggregation, sharded training, and RGT mining rewards.
 
-## Architecture
+> **Part of the Training Network** (3 repos):
+> - **RG_TrainingNet_Chain** — Raft consensus chain, block production
+> - **RG_TrainingNet_Mining** (this) — Gradient aggregation, sharded training, RGT rewards
+> - **RG_TrainingNet_Lighthouse** — Peer discovery, network beacon
 
-This module handles the **mining layer** — training task distribution, gradient compression, parameter aggregation, and miner rewards. It is separate from:
-
-- **RG_DSID_Blockchain** (internal) — DSID logging, governance, Hash Sphere memory
-- **RG_external_blockchain** — Own distributed chain: Raft consensus, P2P network, block production
+> **Not to be confused with:**
+> - **RG_DSID_Blockchain** — Internal audit/governance ledger (completely separate chain)
+> - **RG_DSID_Node** — DSID execution layer (agent runtime, not training)
 
 ## Components
 

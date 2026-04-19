@@ -19,9 +19,9 @@ services:
   # ── RG Lighthouse (Bootstrap/Discovery) ──
   lighthouse:
     build:
-      context: ../RG_lighthouse
+      context: ../RG_TrainingNet_Lighthouse
       dockerfile: Dockerfile
-    container_name: rg_lighthouse
+    container_name: rg_trainingnet_lighthouse
     restart: unless-stopped
     environment:
       - NODE_ID=lighthouse-0
@@ -46,7 +46,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: rg_mining
+    container_name: rg_trainingnet_mining
     restart: unless-stopped
     environment:
       - AUTH_JWT_SECRET_KEY=${AUTH_JWT_SECRET_KEY}
@@ -70,7 +70,7 @@ services:
   # ── Nginx Reverse Proxy (TLS + Rate Limiting) ──
   nginx:
     image: nginx:1.25-alpine
-    container_name: rg_mining_nginx
+    container_name: rg_trainingnet_nginx
     restart: unless-stopped
     ports:
       - "443:443"

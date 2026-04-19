@@ -270,7 +270,7 @@ Interleaves forward and backward to reduce peak activation memory. Recommended f
 
 ## 6. Shard Manager
 
-**Location:** `RG_Mining/app/shard_manager.py`
+**Location:** `RG_TrainingNet_Mining/app/shard_manager.py`
 
 ### Responsibilities
 
@@ -336,7 +336,7 @@ POST /mining/shards/report-ready         → miner reports shard loaded
 
 ## 7. Activation Router
 
-**Location:** `RG_Mining/app/activation_router.py`
+**Location:** `RG_TrainingNet_Mining/app/activation_router.py`
 
 ### Responsibilities
 
@@ -393,7 +393,7 @@ Compression strategies:
 
 ## 8. Sharded Parameter Server
 
-**Location:** Updates to `RG_Mining/app/param_server.py`
+**Location:** Updates to `RG_TrainingNet_Mining/app/param_server.py`
 
 ### Current: Single Parameter Server
 
@@ -449,7 +449,7 @@ For Phase 2-4 (small models), the single `ParameterServer` continues to work. Th
 
 ## 9. Mixture of Experts (MoE) Architecture
 
-**Location:** `RG_Mining/app/model_architecture.py` (new classes)
+**Location:** `RG_TrainingNet_Mining/app/model_architecture.py` (new classes)
 
 ### Why MoE for 405B?
 
@@ -546,7 +546,7 @@ Pro: Simple, no intra-stage communication. Con: Each stage miner needs to hold a
 
 ## 10. Lighthouse Enhancements
 
-**Repo:** `RG_lighthouse`
+**Repo:** `RG_TrainingNet_Lighthouse`
 
 ### New Responsibilities
 
@@ -801,7 +801,7 @@ A miner claims to train but sends random gradients.
 
 ## 16. New Files & Modules
 
-### RG_Mining (Mining Service)
+### RG_TrainingNet_Mining (Mining Service)
 
 | File | Purpose | Phase |
 |---|---|---|
@@ -811,7 +811,7 @@ A miner claims to train but sends random gradients.
 | `app/sharded_param_server.py` | Layer-scoped parameter server | 5 |
 | `app/moe_architecture.py` | MoE layer, router, expert blocks | 6 |
 
-### RG_lighthouse
+### RG_TrainingNet_Lighthouse
 
 | File | Purpose | Phase |
 |---|---|---|
