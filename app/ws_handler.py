@@ -297,6 +297,51 @@ async def handle_mining_ws(ws: WebSocket):
                     )
 
 
+async def _credit_and_notify(
+    ws: WebSocket,
+    miner_id: str,
+    user_id: str,
+    email: str,
+    reward: float,
+    submission,
+    miner,
+):
+    """Credit wallet via Crypto service and notify miner of result."""
+    try:
+        result = await chain_bridge.credit_miner_wallet(
+            user_id=user_id,
+            email=email,
+            rgt_amount=reward,
+            samples_processed=submission.samples_processed,
+            trust_score=miner.trust_score if miner else 1.0,
+            tier=miner.miner_class if miner else "miner",
+            gradient_hash=submission.gradient_hash,
+            task_id=submission.task_id,
+            global_step=param_server.global_step,
+        )
+        # Notify miner of successful credit
+        try:
+            await ws.send_json({
+                "event": "wallet_credited",
+                "rgt_amount": reward,
+                "gradient_hash": submission.gradient_hash,
+                "status": "credited",
+            })
+        except Exception:
+            pass  # WS may have closed
+    except Exception as e:
+        logger.error(f"WS: Wallet credit FAILED for {miner_id}: {e}")
+        try:
+            await ws.send_json({
+                "event": "wallet_credit_failed",
+                "rgt_amount": reward,
+                "gradient_hash": submission.gradient_hash,
+                "error": str(e),
+            })
+        except Exception:
+            pass
+
+
 async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):
     """Process a gradient submission from the WebSocket."""
     try:
@@ -364,18 +409,16 @@ async def _handle_gradient_submit(miner_id: str, data: Dict, ws: WebSocket):
 
         logger.info(f"WS: Gradient accepted from {miner_id} (loss={submission.loss_after:.4f}, reward={reward})")
 
-        # Credit miner's wallet via Crypto service (fire-and-forget)
+        # Credit miner's wallet via Crypto service
         meta = ws_manager.miner_metadata.get(miner_id, {})
-        asyncio.create_task(chain_bridge.credit_miner_wallet(
+        asyncio.create_task(_credit_and_notify(
+            ws=ws,
+            miner_id=miner_id,
             user_id=meta.get("user_id"),
             email=meta.get("account_email"),
-            rgt_amount=reward,
-            samples_processed=submission.samples_processed,
-            trust_score=miner.trust_score if miner else 1.0,
-            tier=miner.miner_class if miner else "miner",
-            gradient_hash=submission.gradient_hash,
-            task_id=submission.task_id,
-            global_step=param_server.global_step,
+            reward=reward,
+            submission=submission,
+            miner=miner,
         ))
 
         # Record on external blockchain (fire-and-forget)

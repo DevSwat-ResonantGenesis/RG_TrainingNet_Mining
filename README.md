@@ -6,7 +6,7 @@ Decentralized LLM training orchestration for the ResonantGenesis network.
 
 This module handles the **mining layer** — training task distribution, gradient compression, parameter aggregation, and miner rewards. It is separate from:
 
-- **RG_Blockchain** (internal) — DSID logging, governance, Hash Sphere memory
+- **RG_DSID_Blockchain** (internal) — DSID logging, governance, Hash Sphere memory
 - **RG_external_blockchain** — Own distributed chain: Raft consensus, P2P network, block production
 
 ## Components

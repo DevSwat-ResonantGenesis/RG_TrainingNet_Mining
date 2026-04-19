@@ -195,6 +195,31 @@ class WeightShardLocationDB(MLBase):
     )
 
 
+class PendingCredit(MLBase):
+    """
+    Persistent credit queue — saves wallet credits BEFORE sending.
+    On startup, any 'pending' credits are retried so no tokens are lost
+    even if the service restarts mid-flight.
+    """
+    __tablename__ = "pending_credits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    gradient_hash = Column(String(64), nullable=False, unique=True, index=True)
+    user_id = Column(String(64), nullable=True)
+    email = Column(String(256), nullable=True)
+    rgt_amount = Column(Float, nullable=False)
+    samples_processed = Column(Integer, nullable=False, default=0)
+    trust_score = Column(Float, nullable=False, default=1.0)
+    tier = Column(String(32), nullable=False, default="miner")
+    task_id = Column(String(64), nullable=False, default="")
+    global_step = Column(BigInteger, nullable=False, default=0)
+    status = Column(String(16), nullable=False, default="pending")  # pending, sent, failed
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    sent_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class WeightVersionDB(MLBase):
     """Persistent storage for weight version snapshots (Merkle roots)."""
     __tablename__ = "weight_versions"

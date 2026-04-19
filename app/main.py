@@ -67,6 +67,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Weight registry persistence skipped (non-fatal): {e}")
 
+    # Retry any pending wallet credits from previous crash
+    try:
+        await chain_bridge.retry_pending_credits()
+    except Exception as e:
+        logger.warning(f"Pending credit retry skipped (non-fatal): {e}")
+
     # Register with Lighthouse (non-blocking, best-effort)
     try:
         await chain_bridge.register_with_lighthouse(service_type="mining")

@@ -6,9 +6,8 @@ Posts accepted gradient submissions to the external blockchain as
 immutable on-chain records. Also handles service registration with
 Lighthouse on startup.
 
-The bridge is fire-and-forget: if the chain or lighthouse is down,
-mining continues and logs a warning. No training is ever blocked by
-a chain write failure.
+Wallet credits use a persistent queue (PendingCredit table) so that
+tokens are never lost even if the service restarts mid-flight.
 """
 
 import asyncio
@@ -17,9 +16,11 @@ import hmac
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 import httpx
+from sqlalchemy import select, update
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +173,101 @@ class ChainBridge:
             hashlib.sha256,
         ).hexdigest()
 
-    async def credit_miner_wallet(
+    # ── Persistent credit queue helpers ──
+
+    async def _save_pending_credit(self, **kwargs):
+        """Save a credit to the persistent queue BEFORE sending."""
+        try:
+            from .ml_db import MLSessionLocal, PendingCredit
+            if not MLSessionLocal:
+                return
+            async with MLSessionLocal() as session:
+                pc = PendingCredit(**kwargs)
+                session.add(pc)
+                await session.commit()
+                logger.debug(f"Saved pending credit: {kwargs.get('gradient_hash', '')[:16]}")
+        except Exception as e:
+            logger.warning(f"Failed to save pending credit to DB: {e}")
+
+    async def _mark_credit_sent(self, gradient_hash: str):
+        """Mark a pending credit as successfully sent."""
+        try:
+            from .ml_db import MLSessionLocal, PendingCredit
+            if not MLSessionLocal:
+                return
+            async with MLSessionLocal() as session:
+                await session.execute(
+                    update(PendingCredit)
+                    .where(PendingCredit.gradient_hash == gradient_hash)
+                    .values(status="sent", sent_at=datetime.now(timezone.utc))
+                )
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"Failed to mark credit sent: {e}")
+
+    async def _mark_credit_failed(self, gradient_hash: str, error: str, attempts: int):
+        """Mark a pending credit as failed with error details."""
+        try:
+            from .ml_db import MLSessionLocal, PendingCredit
+            if not MLSessionLocal:
+                return
+            async with MLSessionLocal() as session:
+                await session.execute(
+                    update(PendingCredit)
+                    .where(PendingCredit.gradient_hash == gradient_hash)
+                    .values(
+                        status="failed" if attempts >= 5 else "pending",
+                        attempts=attempts,
+                        last_error=error[:500],
+                    )
+                )
+                await session.commit()
+        except Exception as e:
+            logger.warning(f"Failed to mark credit failed: {e}")
+
+    async def retry_pending_credits(self):
+        """
+        Called on startup — retries any credits stuck in 'pending' status.
+        This is the key mechanism that prevents token loss on restart.
+        """
+        try:
+            from .ml_db import MLSessionLocal, PendingCredit
+            if not MLSessionLocal:
+                return
+            async with MLSessionLocal() as session:
+                result = await session.execute(
+                    select(PendingCredit)
+                    .where(PendingCredit.status == "pending")
+                    .order_by(PendingCredit.created_at)
+                )
+                pending = result.scalars().all()
+
+            if not pending:
+                return
+
+            logger.info(f"🔄 Retrying {len(pending)} pending wallet credits...")
+            for pc in pending:
+                try:
+                    await self._send_credit_to_crypto(
+                        user_id=pc.user_id,
+                        email=pc.email,
+                        rgt_amount=pc.rgt_amount,
+                        samples_processed=pc.samples_processed,
+                        trust_score=pc.trust_score,
+                        tier=pc.tier,
+                        gradient_hash=pc.gradient_hash,
+                        task_id=pc.task_id,
+                        global_step=pc.global_step,
+                    )
+                    await self._mark_credit_sent(pc.gradient_hash)
+                    logger.info(f"✅ Retry succeeded: {pc.rgt_amount} RGT → {pc.user_id or pc.email}")
+                except Exception as e:
+                    await self._mark_credit_failed(pc.gradient_hash, str(e), (pc.attempts or 0) + 1)
+                    logger.warning(f"Retry failed for {pc.gradient_hash[:16]}: {e}")
+        except Exception as e:
+            logger.warning(f"Pending credit retry scan failed: {e}")
+
+    async def _send_credit_to_crypto(
         self,
         user_id: Optional[str],
         email: Optional[str],
@@ -184,21 +279,12 @@ class ChainBridge:
         task_id: str = "",
         global_step: int = 0,
     ):
-        """
-        Credit mined $RGT to the user's wallet via Crypto service.
-        Fire-and-forget — never blocks training.
-
-        Security: HMAC-signed proof-of-training prevents anyone from
-        calling the credit endpoint without having actually processed
-        a gradient through the mining service.
-        """
-        if not self._enabled:
-            return
-        if not user_id and not email:
-            return
-        if not gradient_hash:
-            logger.warning("Wallet credit skipped: no gradient_hash (no proof-of-training)")
-            return
+        """Send the actual HTTP credit request to crypto service. Raises on failure."""
+        if not INTERNAL_SERVICE_KEY:
+            logger.error(
+                "AUTH_INTERNAL_SERVICE_KEY is NOT set — wallet credits will be rejected by crypto service. "
+                "Set this env var to the same value used by crypto_service."
+            )
 
         timestamp = int(time.time())
         signature = self._sign_credit(gradient_hash, user_id or "", rgt_amount, timestamp)
@@ -232,12 +318,86 @@ class ChainBridge:
                     f"user={user_id or email} "
                     f"(total={data.get('rgt_earned', '?')})"
                 )
+            elif resp.status_code == 403:
+                self._credit_errors += 1
+                detail = resp.text[:200]
+                logger.error(
+                    f"Wallet credit REJECTED (403): {detail}. "
+                    f"Check AUTH_INTERNAL_SERVICE_KEY matches between mining and crypto services."
+                )
+                raise RuntimeError(f"Crypto service rejected credit (403): {detail}")
+            elif resp.status_code == 409:
+                # Already credited — treat as success
+                logger.info(f"Wallet credit: gradient already credited (replay blocked)")
             else:
                 self._credit_errors += 1
-                logger.warning(f"Wallet credit failed ({resp.status_code}): {resp.text[:200]}")
+                detail = resp.text[:200]
+                logger.warning(f"Wallet credit failed ({resp.status_code}): {detail}")
+                raise RuntimeError(f"Crypto service returned {resp.status_code}: {detail}")
+        except (RuntimeError, ValueError):
+            raise
         except Exception as e:
             self._credit_errors += 1
-            logger.warning(f"Wallet credit failed: {e}")
+            logger.warning(f"Wallet credit failed (network/connection): {e}")
+            raise RuntimeError(f"Wallet credit network error: {e}") from e
+
+    async def credit_miner_wallet(
+        self,
+        user_id: Optional[str],
+        email: Optional[str],
+        rgt_amount: float,
+        samples_processed: int,
+        trust_score: float = 1.0,
+        tier: str = "miner",
+        gradient_hash: str = "",
+        task_id: str = "",
+        global_step: int = 0,
+    ):
+        """
+        Credit mined $RGT to the user's wallet via Crypto service.
+
+        Flow: save to DB → send HTTP → mark sent.
+        If the service dies between save and send, retry_pending_credits()
+        picks it up on next startup. Tokens are NEVER lost.
+
+        Raises on failure so the caller can notify the miner.
+        """
+        if not self._enabled:
+            logger.warning("Wallet credit skipped: chain bridge disabled")
+            return
+        if not user_id and not email:
+            raise ValueError("Wallet credit failed: no user_id or email provided")
+        if not gradient_hash:
+            raise ValueError("Wallet credit failed: no gradient_hash (no proof-of-training)")
+
+        # Step 1: Persist to DB BEFORE sending (crash-safe)
+        await self._save_pending_credit(
+            gradient_hash=gradient_hash,
+            user_id=user_id,
+            email=email,
+            rgt_amount=rgt_amount,
+            samples_processed=samples_processed,
+            trust_score=trust_score,
+            tier=tier,
+            task_id=task_id,
+            global_step=global_step,
+        )
+
+        # Step 2: Send to crypto service
+        await self._send_credit_to_crypto(
+            user_id=user_id,
+            email=email,
+            rgt_amount=rgt_amount,
+            samples_processed=samples_processed,
+            trust_score=trust_score,
+            tier=tier,
+            gradient_hash=gradient_hash,
+            task_id=task_id,
+            global_step=global_step,
+        )
+
+        # Step 3: Mark as sent in DB
+        await self._mark_credit_sent(gradient_hash)
 
     # ── Lighthouse registration ──
 
